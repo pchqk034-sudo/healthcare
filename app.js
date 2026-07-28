@@ -1,0 +1,2198 @@
+/* ==========================================================================
+ * app.js — 食事管理・健康アドバイスアプリ本体
+ * 依存ライブラリなし。データは localStorage に保存（端末内で完結）。
+ * 写真解析は任意で Claude Vision API を利用（設定でAPIキーを入力した場合）。
+ * ======================================================================== */
+(function () {
+  "use strict";
+
+  const { FOODS, EXERCISE_MET, BEHAVIOR, GOALS } = window.MEAL_DATA;
+  const MEAL_SLOTS = [
+    { key: "breakfast", label: "朝食", icon: "🌅" },
+    { key: "lunch", label: "昼食", icon: "🌞" },
+    { key: "dinner", label: "夕食", icon: "🌙" },
+    { key: "snack", label: "間食", icon: "🍪" },
+  ];
+  const STORE_KEY = "mealApp.v1";
+  const $ = (sel, el = document) => el.querySelector(sel);
+  const $$ = (sel, el = document) => Array.from(el.querySelectorAll(sel));
+  const fmt = (n, d = 0) => (Math.round(n * 10 ** d) / 10 ** d).toLocaleString("ja-JP");
+  const todayStr = () => new Date().toISOString().slice(0, 10);
+
+  // ---- 状態管理 -----------------------------------------------------------
+  const State = {
+    data: null,
+    // 利用者ごとにプロフィール・記録・設定を分けて保持する
+    blank(name) {
+      return { name: name || "自分", profile: null, logs: {}, customFoods: [], chat: [],
+        settings: { provider: "gemini", keys: { gemini: "", anthropic: "" } } };
+    },
+    load() {
+      let raw = null;
+      try { raw = JSON.parse(localStorage.getItem(STORE_KEY)); } catch (_) { raw = null; }
+      if (!raw) raw = {};
+      // 旧形式（単一利用者）からの移行
+      if (!raw.users) {
+        const u = this.blank("自分");
+        if (raw.profile || raw.logs) {
+          u.profile = raw.profile || null; u.logs = raw.logs || {};
+          u.customFoods = raw.customFoods || []; u.chat = raw.chat || [];
+          u.settings = raw.settings || u.settings;
+        }
+        raw = { users: { u1: u }, currentUser: "u1" };
+      }
+      if (!raw.users || !Object.keys(raw.users).length) raw = { users: { u1: this.blank("自分") }, currentUser: "u1" };
+      if (!raw.users[raw.currentUser]) raw.currentUser = Object.keys(raw.users)[0];
+      this.data = raw;
+      this.hydrate();
+    },
+    // 選択中の利用者のデータを、既存コードが参照する位置へ展開する
+    hydrate() {
+      const u = this.data.users[this.data.currentUser];
+      if (!u.settings) u.settings = { provider: "gemini", keys: { gemini: "", anthropic: "" } };
+      if (!u.logs) u.logs = {};
+      if (!u.customFoods) u.customFoods = [];
+      if (!u.chat) u.chat = [];
+      const s = u.settings;
+      if (!s.keys) s.keys = { gemini: "", anthropic: "" };
+      if (s.apiKey) { // 旧形式(単一キー)の移行
+        const prov = s.provider || "gemini";
+        if (!s.keys[prov]) s.keys[prov] = s.apiKey;
+        delete s.apiKey;
+      }
+      if (!s.provider) s.provider = "gemini";
+      this.data.profile = u.profile; this.data.logs = u.logs;
+      this.data.customFoods = u.customFoods; this.data.chat = u.chat; this.data.settings = s;
+    },
+    save(skipSync) {
+      // 空の記録（日付操作で生成される中身なしデータ）は保存しない
+      Object.keys(this.data.logs).forEach((k) => {
+        if (!dayHasContent(this.data.logs[k])) delete this.data.logs[k];
+      });
+      // 選択中利用者へ書き戻し、保存時は展開分を除いて重複を避ける
+      const u = this.data.users[this.data.currentUser];
+      u.profile = this.data.profile; u.logs = this.data.logs;
+      u.customFoods = this.data.customFoods; u.chat = this.data.chat; u.settings = this.data.settings;
+      u.updatedAt = Date.now();               // 同期時の競合解決に使用
+      localStorage.setItem(STORE_KEY, JSON.stringify(this.persistable()));
+      if (!skipSync && typeof Sync !== "undefined") Sync.schedulePush();
+    },
+    // 保存・同期する形（展開済みデータを除いたもの）
+    persistable() {
+      const { profile, logs, customFoods, chat, settings, ...persist } = this.data;
+      return persist;
+    },
+    // クラウドから取得したデータを取り込む（利用者ごと・日付ごとにマージ）
+    mergeRemote(remote) {
+      if (!remote || !remote.users) return false;
+      const local = this.persistable();
+      // 削除済み利用者は再同期で復活させない
+      const deleted = new Set((local.deletedUsers || []).concat(remote.deletedUsers || []));
+      const ids = new Set(Object.keys(local.users || {}).concat(Object.keys(remote.users || {})));
+      const users = {};
+      ids.forEach((id) => {
+        if (deleted.has(id)) return;
+        const a = (local.users || {})[id], b = (remote.users || {})[id];
+        if (!a || !b) { users[id] = a || b; return; }
+        const newer = (a.updatedAt || 0) >= (b.updatedAt || 0) ? a : b;
+        const older = newer === a ? b : a;
+        // 日付ごとの記録は和集合。同じ日付が両方にあれば新しい側を採用
+        const logs = Object.assign({}, older.logs || {}, newer.logs || {});
+        // カスタム料理は名前で重複排除
+        const seen = new Set(), customFoods = [];
+        (newer.customFoods || []).concat(older.customFoods || []).forEach((f) => {
+          if (!seen.has(f.name)) { seen.add(f.name); customFoods.push(f); }
+        });
+        // 設定は新しい側を優先しつつ、空のAPIキーは古い側で補完
+        const keys = Object.assign({}, (older.settings || {}).keys || {});
+        Object.entries(((newer.settings || {}).keys) || {}).forEach(([k, v]) => { if (v) keys[k] = v; });
+        users[id] = Object.assign({}, older, newer, {
+          logs, customFoods, keys: undefined,
+          settings: Object.assign({}, older.settings, newer.settings, { keys }),
+          chat: (newer.chat || []).length >= (older.chat || []).length ? newer.chat : older.chat,
+          updatedAt: Math.max(a.updatedAt || 0, b.updatedAt || 0),
+        });
+        delete users[id].keys;
+      });
+      this.data.users = users;
+      this.data.deletedUsers = Array.from(deleted);
+      if (!users[this.data.currentUser]) this.data.currentUser = Object.keys(users)[0];
+      this.hydrate();
+      this.save(true);
+      return true;
+    },
+    users() { return Object.entries(this.data.users).map(([id, u]) => ({ id, name: u.name })); },
+    currentName() { return this.data.users[this.data.currentUser].name; },
+    renameUser(id, name) { if (this.data.users[id]) { this.data.users[id].name = name; this.save(); } },
+    log(date) {
+      if (!this.data.logs[date]) {
+        this.data.logs[date] = {
+          meals: { breakfast: [], lunch: [], dinner: [], snack: [] },
+          activity: { steps: 0, behavior: BEHAVIOR[0].name, exercises: [] },
+          weight: null,
+        };
+      }
+      const l = this.data.logs[date];
+      if (!l.meals) l.meals = { breakfast: [], lunch: [], dinner: [], snack: [] };
+      if (!l.activity) l.activity = { steps: 0, behavior: BEHAVIOR[0].name, exercises: [] };
+      if (!("weight" in l)) l.weight = null;
+      // からだの記録（水分ml・睡眠h・血圧・血糖・体脂肪率・ウエスト）
+      if (!("water" in l)) l.water = 0;
+      if (!("sleep" in l)) l.sleep = null;
+      if (!("bp" in l)) l.bp = null;         // {sys, dia}
+      if (!("glucose" in l)) l.glucose = null;
+      if (!("bodyFat" in l)) l.bodyFat = null;
+      if (!("waist" in l)) l.waist = null;
+      return l;
+    },
+  };
+
+  // ---- クラウド同期（GitHub Gist・非公開） ---------------------------------
+  // 端末をまたいで同じデータを使うための同期。設定は端末ごと（同期対象外）。
+  const SYNC_KEY = "mealApp.sync";
+  const SYNC_FILE = "meal-health.json";
+  const Sync = {
+    cfg: {},
+    busy: false,
+    timer: null,
+    load() { try { this.cfg = JSON.parse(localStorage.getItem(SYNC_KEY)) || {}; } catch (_) { this.cfg = {}; } },
+    saveCfg() { localStorage.setItem(SYNC_KEY, JSON.stringify(this.cfg)); },
+    enabled() { return !!this.cfg.token; },
+    async api(path, opts) {
+      const res = await fetch(`https://api.github.com${path}`, Object.assign({}, opts, {
+        headers: Object.assign({
+          authorization: `Bearer ${this.cfg.token}`,
+          accept: "application/vnd.github+json",
+          "content-type": "application/json",
+        }, (opts || {}).headers),
+      }));
+      if (!res.ok) {
+        const msg = res.status === 401 ? "トークンが無効です" : res.status === 404 ? "同期IDが見つかりません" : (await res.text()).slice(0, 120);
+        throw new Error(`同期エラー ${res.status}: ${msg}`);
+      }
+      return res.json();
+    },
+    async push() {
+      const content = JSON.stringify({ app: "meal-health", v: 1, at: Date.now(), data: State.persistable() });
+      const files = { [SYNC_FILE]: { content } };
+      if (this.cfg.gistId) {
+        await this.api(`/gists/${this.cfg.gistId}`, { method: "PATCH", body: JSON.stringify({ files }) });
+      } else {
+        const g = await this.api("/gists", { method: "POST", body: JSON.stringify({
+          description: "ミール・ヘルスケア 同期データ", public: false, files }) });
+        this.cfg.gistId = g.id;
+      }
+      this.cfg.lastSync = Date.now(); this.saveCfg();
+    },
+    async pull() {
+      if (!this.cfg.gistId) return null;
+      const g = await this.api(`/gists/${this.cfg.gistId}`);
+      const f = g.files && g.files[SYNC_FILE];
+      if (!f) return null;
+      const text = f.truncated ? await (await fetch(f.raw_url)).text() : f.content;
+      const j = JSON.parse(text);
+      return j && j.data ? j.data : null;
+    },
+    // 取得 → マージ → 送信
+    async sync() {
+      if (!this.enabled() || this.busy) return false;
+      this.busy = true;
+      try {
+        const remote = await this.pull();
+        if (remote) State.mergeRemote(remote);
+        await this.push();
+        return true;
+      } finally { this.busy = false; }
+    },
+    // 保存のたびに呼ばれる。まとめて数秒後に送信する
+    schedulePush() {
+      if (!this.enabled()) return;
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => {
+        this.push().then(() => updateSyncBadge()).catch(() => updateSyncBadge("エラー"));
+      }, 4000);
+    },
+  };
+  function syncStatusText() {
+    if (!Sync.enabled()) return "未設定";
+    if (!Sync.cfg.lastSync) return "未同期";
+    const m = Math.round((Date.now() - Sync.cfg.lastSync) / 60000);
+    return m < 1 ? "たった今同期" : m < 60 ? `${m}分前に同期` : `${Math.round(m / 60)}時間前に同期`;
+  }
+  function updateSyncBadge(err) {
+    const el = document.getElementById("sync-status");
+    if (el) el.textContent = err ? `同期エラー` : syncStatusText();
+  }
+
+  // ---- 身体指標の計算 ----------------------------------------------------
+  const Metrics = {
+    bmi(p) { const m = p.height / 100; return p.weight / (m * m); },
+    bmiCategory(bmi) {
+      if (bmi < 18.5) return { label: "低体重(やせ)", tone: "warn" };
+      if (bmi < 25) return { label: "普通体重", tone: "good" };
+      if (bmi < 30) return { label: "肥満(1度)", tone: "warn" };
+      return { label: "肥満(2度以上)", tone: "bad" };
+    },
+    // Mifflin-St Jeor 式による基礎代謝量(kcal/日)
+    bmr(p) {
+      const base = 10 * p.weight + 6.25 * p.height - 5 * p.age;
+      return p.sex === "male" ? base + 5 : base - 161;
+    },
+    // その日の総消費カロリー = 基礎代謝 + 生活活動(NEAT) + 歩数 + 運動
+    burned(p, activity) {
+      const bmr = this.bmr(p);
+      const beh = BEHAVIOR.find((b) => b.name === activity.behavior) || BEHAVIOR[0];
+      const neat = bmr * (beh.factor - 1); // 生活活動による上乗せ
+      const stepKcal = (activity.steps || 0) * (p.weight / 70) * 0.04; // 1歩あたり概算
+      const exKcal = (activity.exercises || []).reduce(
+        (s, e) => s + e.met * p.weight * (e.minutes / 60) * 1.05, 0);
+      return { bmr, neat, stepKcal, exKcal, total: bmr + neat + stepKcal + exKcal };
+    },
+    // 1日の目標摂取カロリー（消費 × 目標補正）
+    targetIntake(p, burnedTotal) {
+      const goal = GOALS.find((g) => g.key === p.goal) || GOALS[1];
+      return burnedTotal * (1 + goal.adjust);
+    },
+    // 栄養素の1日推奨量
+    nutrientTargets(p, targetKcal) {
+      // たんぱく質: 目標により体重あたりを変える
+      const gPerKg = p.goal === "muscle" ? 1.6 : p.goal === "diet" ? 1.4 : 1.1;
+      const protein = p.weight * gPerKg;
+      const fat = (targetKcal * 0.25) / 9;           // 脂質は総kcalの25%目安
+      const carb = (targetKcal - protein * 4 - fat * 9) / 4;
+      const fiber = p.sex === "male" ? 21 : 18;      // 食物繊維(g/日)
+      const saltMax = p.sex === "male" ? 7.5 : 6.5;  // 食塩相当量 上限(g/日)
+      return { protein, fat, carb, fiber, saltMax };
+    },
+  };
+
+  // ---- 集計 ---------------------------------------------------------------
+  function sumItems(items) {
+    return (items || []).reduce((a, it) => ({
+      kcal: a.kcal + it.kcal * it.qty,
+      p: a.p + it.p * it.qty,
+      f: a.f + it.f * it.qty,
+      c: a.c + it.c * it.qty,
+      fiber: a.fiber + it.fiber * it.qty,
+      salt: a.salt + it.salt * it.qty,
+    }), { kcal: 0, p: 0, f: 0, c: 0, fiber: 0, salt: 0 });
+  }
+  function dayTotals(log) {
+    const slots = {};
+    let all = { kcal: 0, p: 0, f: 0, c: 0, fiber: 0, salt: 0 };
+    MEAL_SLOTS.forEach((s) => {
+      const t = sumItems(log.meals[s.key]);
+      slots[s.key] = t;
+      Object.keys(all).forEach((k) => (all[k] += t[k]));
+    });
+    return { slots, all };
+  }
+  // その日に実質的な入力があるか（食事・歩数・運動・体重のいずれか）
+  function dayHasContent(l) {
+    if (!l) return false;
+    if (dayTotals(l).all.kcal > 0) return true;
+    const a = l.activity || {};
+    if ((a.steps || 0) > 0) return true;
+    if ((a.exercises || []).length > 0) return true;
+    if (l.weight != null) return true;
+    if ((l.water || 0) > 0) return true;
+    return l.sleep != null || l.bp != null || l.glucose != null || l.bodyFat != null || l.waist != null;
+  }
+
+  // ---- 継続・予測などのヘルパー -------------------------------------------
+  const dstr = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  // 連続記録日数（今日 or 昨日を起点に遡る）
+  function streakDays() {
+    const logs = State.data.logs;
+    const has = (d) => dayHasContent(logs[dstr(d)]);
+    const start = new Date();
+    if (!has(start)) { start.setDate(start.getDate() - 1); if (!has(start)) return 0; }
+    let n = 0; const d = new Date(start);
+    while (has(d)) { n++; d.setDate(d.getDate() - 1); }
+    return n;
+  }
+  // 最後に食べた時刻（断食タイマー用）
+  function lastMealAt() {
+    let max = 0;
+    Object.values(State.data.logs).forEach((l) => {
+      if (!l.meals) return;
+      Object.values(l.meals).forEach((items) => (items || []).forEach((it) => {
+        if (it.at && it.at > max) max = it.at;
+      }));
+    });
+    return max || null;
+  }
+  // 体重の直近傾向から先の体重を予測（最小二乗法）
+  function weightProjection(days = 30) {
+    const pts = [];
+    Object.keys(State.data.logs).sort().forEach((k) => {
+      const l = State.data.logs[k];
+      if (l && l.weight != null) pts.push({ t: new Date(k).getTime() / 86400000, w: l.weight });
+    });
+    const recent = pts.slice(-14);
+    if (recent.length < 3) return null;
+    const n = recent.length;
+    const mx = recent.reduce((a, b) => a + b.t, 0) / n;
+    const my = recent.reduce((a, b) => a + b.w, 0) / n;
+    let num = 0, den = 0;
+    recent.forEach(({ t, w }) => { num += (t - mx) * (w - my); den += (t - mx) ** 2; });
+    if (!den) return null;
+    // 短期の傾きをそのまま外挿すると非現実的になるため、±4kg/月に丸める
+    const raw = num / den;                                      // kg/日
+    const slope = Math.max(-4 / 30, Math.min(4 / 30, raw));     // クランプ後 kg/日
+    const last = recent[recent.length - 1].w;
+    const res = { slope, raw, capped: Math.abs(raw - slope) > 1e-9,
+      perMonth: slope * 30, predicted: last + slope * days, days, current: last, etaDays: null };
+    const tw = State.data.profile && State.data.profile.targetWeight;
+    if (tw && Math.abs(slope) > 0.002 && (tw - last) / slope > 0) res.etaDays = Math.round((tw - last) / slope);
+    return res;
+  }
+  // 直近n日の集計（水分・睡眠・お酒・カフェイン）
+  function weeklyBody(n = 7) {
+    const logs = State.data.logs;
+    let water = 0, wN = 0, sleep = 0, sN = 0, alcoholDays = 0, alcoholKcal = 0, coffee = 0;
+    const alcoholRe = /ビール|日本酒|ワイン|ハイボール|焼酎|サワー|チューハイ|酒/;
+    const coffeeRe = /コーヒー|カフェラテ|ラテ/;
+    for (let i = 0; i < n; i++) {
+      const d = new Date(); d.setDate(d.getDate() - i);
+      const l = logs[dstr(d)];
+      if (!l) continue;
+      if ((l.water || 0) > 0) { water += l.water; wN++; }
+      if (l.sleep != null) { sleep += l.sleep; sN++; }
+      let dayAlc = 0;
+      Object.values(l.meals || {}).forEach((items) => (items || []).forEach((it) => {
+        if (alcoholRe.test(it.name)) { dayAlc += it.kcal * it.qty; }
+        if (coffeeRe.test(it.name)) coffee += it.qty;
+      }));
+      if (dayAlc > 0) { alcoholDays++; alcoholKcal += dayAlc; }
+    }
+    return {
+      waterAvg: wN ? water / wN : null, sleepAvg: sN ? sleep / sN : null,
+      alcoholDays, alcoholKcal, coffee, days: n,
+    };
+  }
+  const waterTarget = () => Math.round((State.data.profile ? State.data.profile.weight : 60) * 35);
+
+  // ---- ナビゲーション -----------------------------------------------------
+  const Nav = {
+    tabs: [
+      { key: "dashboard", label: "ダッシュボード", icon: "📊" },
+      { key: "record", label: "記録する", icon: "✍️" },
+      { key: "body", label: "からだ", icon: "❤️" },
+      { key: "chat", label: "AI相談", icon: "💬" },
+      { key: "trend", label: "推移グラフ", icon: "📈" },
+      { key: "profile", label: "プロフィール", icon: "👤" },
+      { key: "settings", label: "設定", icon: "⚙️" },
+    ],
+    current: "dashboard",
+    go(key) { this.current = key; render(); window.scrollTo(0, 0); },
+  };
+
+  // ==========================================================================
+  //  レンダリング
+  // ==========================================================================
+  function render() {
+    const app = $("#app");
+    if (!State.data.profile) { Nav.current = "profile"; }
+    app.innerHTML = `
+      <header class="topbar">
+        <div class="brand">🍱 <span>ミール・ヘルスケア</span></div>
+        <div class="today">${new Date().toLocaleDateString("ja-JP", { month: "long", day: "numeric", weekday: "short" })}</div>
+      </header>
+      <nav class="tabs">
+        ${Nav.tabs.map((t) => `<button class="tab ${Nav.current === t.key ? "active" : ""}" data-tab="${t.key}">
+           <span class="ti">${t.icon}</span><span class="tl">${t.label}</span></button>`).join("")}
+      </nav>
+      <main id="view"></main>`;
+    $$(".tab").forEach((b) => (b.onclick = () => Nav.go(b.dataset.tab)));
+    const view = $("#view");
+    if (!State.data.profile && Nav.current !== "profile") Nav.current = "profile";
+    ({
+      dashboard: renderDashboard,
+      record: renderRecord,
+      body: renderBody,
+      chat: renderChat,
+      trend: renderTrend,
+      profile: renderProfile,
+      settings: renderSettings,
+    })[Nav.current](view);
+  }
+
+  // ---- プロフィール -------------------------------------------------------
+  function renderProfile(view) {
+    const p = State.data.profile || { sex: "male", goal: "health" };
+    view.innerHTML = `
+      <section class="card">
+        <h2>プロフィール設定</h2>
+        <p class="muted">身長・体重・性別・年齢と目標を入力すると、BMI・基礎代謝を自動計算し、毎日の分析に使います。</p>
+        <div class="form-grid">
+          <label>身長 (cm)<input type="number" id="pf-height" value="${p.height ?? ""}" min="100" max="230" step="0.1"></label>
+          <label>体重 (kg)<input type="number" id="pf-weight" value="${p.weight ?? ""}" min="30" max="200" step="0.1"></label>
+          <label>年齢<input type="number" id="pf-age" value="${p.age ?? ""}" min="10" max="100"></label>
+          <label>性別
+            <select id="pf-sex">
+              <option value="male" ${p.sex === "male" ? "selected" : ""}>男性</option>
+              <option value="female" ${p.sex === "female" ? "selected" : ""}>女性</option>
+            </select>
+          </label>
+          <label>目標体重 (kg・任意)<input type="number" id="pf-target" value="${p.targetWeight ?? ""}" min="30" max="200" step="0.1"></label>
+          <label>目的・目標
+            <select id="pf-goal">
+              ${GOALS.map((g) => `<option value="${g.key}" ${p.goal === g.key ? "selected" : ""}>${g.name}（${g.desc}）</option>`).join("")}
+            </select>
+          </label>
+        </div>
+        <button class="btn primary" id="pf-save">保存して計算する</button>
+        <div id="pf-result"></div>
+      </section>`;
+    $("#pf-save").onclick = () => {
+      const np = {
+        height: parseFloat($("#pf-height").value),
+        weight: parseFloat($("#pf-weight").value),
+        age: parseInt($("#pf-age").value, 10),
+        sex: $("#pf-sex").value,
+        goal: $("#pf-goal").value,
+        targetWeight: parseFloat($("#pf-target").value) || null,
+      };
+      if (!(np.height > 0 && np.weight > 0 && np.age > 0)) {
+        alert("身長・体重・年齢を正しく入力してください。");
+        return;
+      }
+      State.data.profile = np;
+      // 当日の体重が未記録なら profile の体重で初期化
+      const l = State.log(todayStr());
+      if (l.weight == null) l.weight = np.weight;
+      State.save();
+      showProfileResult(np);
+    };
+    if (State.data.profile) showProfileResult(State.data.profile);
+  }
+  function showProfileResult(p) {
+    const bmi = Metrics.bmi(p);
+    const cat = Metrics.bmiCategory(bmi);
+    const bmr = Metrics.bmr(p);
+    const b = Metrics.burned(p, { steps: 6000, behavior: BEHAVIOR[1].name, exercises: [] });
+    const goal = GOALS.find((g) => g.key === p.goal) || GOALS[1];
+    const target = Metrics.targetIntake(p, b.total);
+    $("#pf-result").innerHTML = `
+      <div class="result-grid">
+        <div class="stat"><div class="stat-l">BMI</div><div class="stat-v">${fmt(bmi, 1)}</div><div class="badge ${cat.tone}">${cat.label}</div></div>
+        <div class="stat"><div class="stat-l">基礎代謝</div><div class="stat-v">${fmt(bmr)}<small>kcal</small></div><div class="muted">何もしなくても消費</div></div>
+        <div class="stat"><div class="stat-l">目安の消費<small>(出社+6千歩)</small></div><div class="stat-v">${fmt(b.total)}<small>kcal</small></div></div>
+        <div class="stat"><div class="stat-l">目標摂取</div><div class="stat-v">${fmt(target)}<small>kcal</small></div><div class="muted">${goal.name}</div></div>
+      </div>
+      <p class="muted">※ 消費・目標は当日の歩数や行動で変わります。「記録する」で毎日の実測値を入れてください。</p>`;
+  }
+
+  // ---- 記録する（当日の食事・活動） --------------------------------------
+  let recordDate = todayStr();
+  let dashDate = todayStr();
+  function renderRecord(view) {
+    const p = State.data.profile;
+    const log = State.log(recordDate);
+    view.innerHTML = `
+      <section class="card">
+        <div class="row between wrap">
+          <h2>記録する</h2>
+          <div class="row wrap" style="gap:8px">
+            <input type="date" id="rec-date" value="${recordDate}" max="${todayStr()}">
+            ${recordDate === todayStr() ? "" : `<button class="btn sm" id="rec-today">今日に戻る</button>`}
+          </div>
+        </div>
+
+        <div class="meals">
+          ${MEAL_SLOTS.map((s) => renderMealSlot(s, log)).join("")}
+        </div>
+
+        <h3 class="mt">消費カロリー（活動）</h3>
+        <div class="form-grid">
+          <label>歩数<input type="number" id="ac-steps" value="${log.activity.steps || ""}" min="0" step="100" placeholder="例: 8000"></label>
+          <label>今日の行動パターン
+            <select id="ac-behavior">
+              ${BEHAVIOR.map((b) => `<option value="${b.name}" ${log.activity.behavior === b.name ? "selected" : ""}>${b.name}</option>`).join("")}
+            </select>
+          </label>
+          <label>体重 (kg)<input type="number" id="ac-weight" value="${log.weight ?? ""}" min="30" max="200" step="0.1" placeholder="任意"></label>
+        </div>
+
+        <div class="ex-add">
+          <div class="row wrap">
+            <select id="ex-name">${EXERCISE_MET.map((e) => `<option value="${e.name}">${e.name}（${e.level}）</option>`).join("")}</select>
+            <input type="number" id="ex-min" placeholder="分" min="1" step="5" style="max-width:90px">
+            <button class="btn" id="ex-add">運動を追加</button>
+          </div>
+          <ul class="chips">
+            ${(log.activity.exercises || []).map((e, i) => `<li class="chip">${e.name} ${e.minutes}分 <button data-ex="${i}">×</button></li>`).join("")}
+          </ul>
+        </div>
+
+        <button class="btn primary block" id="rec-save">この日の記録を保存</button>
+        ${State.data.logs[recordDate] ? `<button class="btn danger block" id="rec-del">この日の記録を削除</button>` : ""}
+      </section>`;
+
+    $("#rec-date").onchange = (e) => { recordDate = e.target.value; render(); };
+    const recDel = $("#rec-del");
+    if (recDel) recDel.onclick = () => {
+      if (confirm(`${recordDate} の記録を削除します。よろしいですか？`)) {
+        delete State.data.logs[recordDate]; State.save(); render();
+      }
+    };
+    const recToday = $("#rec-today");
+    if (recToday) recToday.onclick = () => { recordDate = todayStr(); render(); };
+    MEAL_SLOTS.forEach((s) => {
+      $(`#add-${s.key}`).onclick = () => openFoodPicker(s);
+      $(`#photo-${s.key}`).onclick = () => openPhotoPicker(s);
+      const again = $(`#again-${s.key}`);
+      if (again) again.onclick = () => {
+        const prev = lastSameSlot(s.key);
+        if (!prev) return;
+        const names = prev.items.map((it) => it.name).join("、");
+        if (!confirm(`${prev.date} の${s.label}（${names}）をコピーしますか？`)) return;
+        prev.items.forEach((it) => log.meals[s.key].push({ ...it, at: Date.now() }));
+        State.save(); render();
+      };
+      $$(`[data-del="${s.key}"]`).forEach((btn) => {
+        btn.onclick = () => {
+          log.meals[s.key].splice(parseInt(btn.dataset.idx, 10), 1);
+          State.save(); render();
+        };
+      });
+    });
+    $("#ex-add").onclick = () => {
+      const name = $("#ex-name").value;
+      const min = parseInt($("#ex-min").value, 10);
+      if (!(min > 0)) return alert("運動時間(分)を入力してください。");
+      const met = EXERCISE_MET.find((e) => e.name === name);
+      log.activity.exercises.push({ name, met: met.met, minutes: min });
+      State.save(); render();
+    };
+    $$(".chips [data-ex]").forEach((b) => {
+      b.onclick = () => { log.activity.exercises.splice(parseInt(b.dataset.ex, 10), 1); State.save(); render(); };
+    });
+    $("#rec-save").onclick = () => {
+      log.activity.steps = parseInt($("#ac-steps").value, 10) || 0;
+      log.activity.behavior = $("#ac-behavior").value;
+      const w = parseFloat($("#ac-weight").value);
+      log.weight = w > 0 ? w : null;
+      if (w > 0) State.data.profile.weight = w; // 最新体重をプロフィールに反映
+      State.save();
+      alert("保存しました。ダッシュボードで分析を確認できます。");
+      Nav.go("dashboard");
+    };
+  }
+  function renderMealSlot(s, log) {
+    const items = log.meals[s.key];
+    const t = sumItems(items);
+    return `
+      <div class="meal">
+        <div class="meal-head">
+          <span>${s.icon} ${s.label}</span>
+          <span class="meal-kcal">${fmt(t.kcal)} kcal</span>
+        </div>
+        <ul class="items">
+          ${items.length ? items.map((it, i) => `
+            <li><span>${it.name}${it.qty !== 1 ? ` ×${it.qty}` : ""}</span>
+            <span>${fmt(it.kcal * it.qty)}kcal <button data-del="${s.key}" data-idx="${i}">×</button></span></li>`).join("")
+            : `<li class="muted">まだ記録がありません</li>`}
+        </ul>
+        <div class="row wrap">
+          <button class="btn sm" id="add-${s.key}">＋ 料理を選ぶ</button>
+          <button class="btn sm ai" id="photo-${s.key}">📷 写真で解析</button>
+          ${lastSameSlot(s.key) ? `<button class="btn sm" id="again-${s.key}">🔁 前回と同じ</button>` : ""}
+        </div>
+      </div>`;
+  }
+  // その食事枠で最後に記録した内容（recordDateより前の直近日）
+  function lastSameSlot(slotKey) {
+    const dates = Object.keys(State.data.logs).filter((k) => k < recordDate).sort().reverse();
+    for (const k of dates) {
+      const items = (State.data.logs[k].meals || {})[slotKey];
+      if (items && items.length) return { date: k, items };
+    }
+    return null;
+  }
+
+  // 料理の使用回数を集計（全記録から料理名ごとにカウント）
+  function foodUsageCounts() {
+    const counts = {};
+    Object.values(State.data.logs).forEach((l) => {
+      if (!l.meals) return;
+      Object.values(l.meals).forEach((items) => (items || []).forEach((it) => {
+        counts[it.name] = (counts[it.name] || 0) + 1;
+      }));
+    });
+    return counts;
+  }
+  // 候補一覧 = 内蔵DB + 写真から追加したカスタム料理
+  function allFoods() {
+    return FOODS.concat(State.data.customFoods || []);
+  }
+  // 写真で認識した料理を候補（カスタム料理）に登録（内蔵と重複しなければ）
+  function addCustomFood(it) {
+    const name = it.name || "料理";
+    if (FOODS.some((f) => f.name === name)) return;
+    if (!State.data.customFoods) State.data.customFoods = [];
+    const food = { name, cat: "AI", unit: "1食",
+      kcal: Math.round(it.kcal || 0), p: it.p || 0, f: it.f || 0, c: it.c || 0, fiber: it.fiber || 0, salt: it.salt || 0 };
+    const idx = State.data.customFoods.findIndex((f) => f.name === name);
+    if (idx >= 0) State.data.customFoods[idx] = food; else State.data.customFoods.push(food);
+  }
+
+  // ---- 料理選択モーダル ---------------------------------------------------
+  function openFoodPicker(slot) {
+    const modal = makeModal(`${slot.icon} ${slot.label}に追加`);
+    const body = $(".modal-body", modal);
+    body.innerHTML = `
+      <input type="search" id="fp-q" placeholder="料理名で検索（例: 鮭、サラダ）" autocomplete="off">
+      <p class="muted">よく使う料理が上に並びます。写真で解析した料理も候補に入ります。</p>
+      <div id="fp-list" class="fp-list"></div>`;
+    const listEl = $("#fp-list", body);
+    const draw = (q) => {
+      const counts = foodUsageCounts();
+      const items = allFoods()
+        .map((f, i) => ({ f, i }))
+        .filter(({ f }) => !q || f.name.includes(q) || f.cat.includes(q))
+        // 使用回数の多い順 → 同数なら元の並び順
+        .sort((a, b) => (counts[b.f.name] || 0) - (counts[a.f.name] || 0) || a.i - b.i)
+        .map((x) => x.f);
+      listEl.innerHTML = items.map((f) => {
+        const n = counts[f.name] || 0;
+        return `<button class="fp-item" data-name="${encodeURIComponent(f.name)}">
+          <span class="fp-name">${f.name}${f.cat === "AI" ? ' <span class="badge info sm">写真</span>' : ""}
+            <small>${f.unit}・${f.cat}${n ? `・${n}回` : ""}</small></span>
+          <span class="fp-k">${f.kcal}kcal</span>
+        </button>`;
+      }).join("") || `<p class="muted">該当なし。「写真で解析」もお試しください。</p>`;
+      $$(".fp-item", listEl).forEach((b) => {
+        b.onclick = () => {
+          const name = decodeURIComponent(b.dataset.name);
+          const f = allFoods().find((x) => x.name === name);
+          if (!f) return;
+          const qty = parseFloat(prompt(`「${f.name}」の量（${f.unit} を1として）`, "1"));
+          if (!(qty > 0)) return;
+          State.log(recordDate).meals[slot.key].push({ ...f, qty, at: Date.now() });
+          State.save(); modal.remove(); render();
+        };
+      });
+    };
+    $("#fp-q", body).oninput = (e) => draw(e.target.value.trim());
+    draw("");
+  }
+
+  // 現在選択中サービスのAPIキーを返す
+  function activeKey() {
+    const s = State.data.settings;
+    const prov = s.provider || "gemini";
+    return (s.keys || {})[prov] || "";
+  }
+
+  // ---- 写真AI解析モーダル -------------------------------------------------
+  function openPhotoPicker(slot) {
+    const modal = makeModal(`📷 ${slot.label}を写真で解析`);
+    const body = $(".modal-body", modal);
+    const hasKey = !!activeKey();
+    body.innerHTML = `
+      <p class="muted">料理の写真から、料理名・カロリー・食材・栄養素をAIが推定します。</p>
+      <label class="filedrop"><input type="file" id="ph-file" accept="image/*" hidden>
+        <span>📷 ライブラリから選ぶ / 撮影する</span></label>
+      <div id="ph-preview"></div>
+      <div id="ph-status"></div>
+      <div id="ph-result"></div>
+      ${hasKey ? "" : `<p class="warn-box">⚠️ AI解析には設定画面でAPIキーの登録が必要です（無料のGoogle Geminiも選べます）。未登録の場合は「料理を選ぶ」から手動で追加してください。</p>`}`;
+    $("#ph-file", body).onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        $("#ph-preview", body).innerHTML = `<img src="${reader.result}" class="ph-img" alt="preview">`;
+        analyzePhoto(reader.result, slot, modal);
+      };
+      reader.readAsDataURL(file);
+    };
+  }
+
+  async function analyzePhoto(dataUrl, slot, modal) {
+    const statusEl = $("#ph-status", modal);
+    const resultEl = $("#ph-result", modal);
+    const provider = State.data.settings.provider || "gemini";
+    const key = activeKey();
+    if (!key) { statusEl.innerHTML = `<p class="muted">選択中のサービスのAPIキーが未設定です。設定画面で登録してください。</p>`; return; }
+    statusEl.innerHTML = `<p class="loading">🤖 AIが解析中…（数秒かかります）</p>`;
+    resultEl.innerHTML = "";
+    const [meta, b64] = dataUrl.split(",");
+    const media = (meta.match(/data:(.*?);/) || [])[1] || "image/jpeg";
+    const schemaHint = `次のJSON形式のみで回答してください（説明文やコードブロックは不要）:
+{"items":[{"name":"料理名","kcal":整数,"p":たんぱく質g,"f":脂質g,"c":炭水化物g,"fiber":食物繊維g,"salt":食塩相当量g,"ingredients":["主な食材",...]}]}
+写真に写る料理ごとに1食分の推定値を入れてください。`;
+    const prompt = `この料理写真を管理栄養士として分析してください。${schemaHint}`;
+    const model = State.data.settings.model || "claude-opus-4-8";
+    try {
+      const items = provider === "gemini"
+        ? await callGemini(key, media, b64, prompt)
+        : await callAnthropic(key, media, b64, prompt, model);
+      showPhotoResult(items, slot, modal, statusEl, resultEl);
+    } catch (e) {
+      statusEl.innerHTML = `<p class="warn-box">解析に失敗しました: ${e.message}<br>「料理を選ぶ」から手動で追加してください。</p>`;
+    }
+  }
+  function extractItems(text) {
+    const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+    return parsed.items || [];
+  }
+  // Anthropic Claude で解析（ブラウザ直接呼び出し）
+  async function callAnthropic(key, media, b64, prompt, model) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({
+        model: model || "claude-opus-4-8",
+        max_tokens: 1024,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: media, data: b64 } },
+            { type: "text", text: prompt },
+          ],
+        }],
+      }),
+    });
+    if (!res.ok) throw new Error(`APIエラー ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const json = await res.json();
+    const text = (json.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+    return extractItems(text);
+  }
+  // Google Gemini で解析（無料枠あり）。モデル終了に備え候補を順に試す。
+  async function callGemini(key, media, b64, prompt) {
+    const models = State.data.settings.geminiModel
+      ? [State.data.settings.geminiModel]
+      : ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"];
+    const body = JSON.stringify({
+      contents: [{ parts: [
+        { inline_data: { mime_type: media, data: b64 } },
+        { text: prompt },
+      ] }],
+      generationConfig: { responseMimeType: "application/json" },
+    });
+    let lastErr = null;
+    for (const model of models) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
+      const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body });
+      if (res.status === 404) { lastErr = `モデル ${model} は利用不可`; continue; } // 次の候補へ
+      if (!res.ok) throw new Error(`Geminiエラー ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      const json = await res.json();
+      const text = ((json.candidates || [])[0]?.content?.parts || []).map((p) => p.text || "").join("");
+      if (!text) throw new Error("応答が空でした（無料枠の上限や画像内容をご確認ください）");
+      return extractItems(text);
+    }
+    throw new Error(`利用可能なGeminiモデルが見つかりませんでした（${lastErr || "不明"}）`);
+  }
+  // ---- テキスト会話用のAI呼び出し（AI相談・レシピ提案で共用） --------------
+  async function askAI(msgs, system) {
+    const provider = State.data.settings.provider || "gemini";
+    const key = activeKey();
+    if (!key) throw new Error("APIキーが未設定です。設定タブで登録してください。");
+    return provider === "gemini"
+      ? askGemini(key, msgs, system)
+      : askAnthropic(key, msgs, system, State.data.settings.model || "claude-opus-4-8");
+  }
+  async function askAnthropic(key, msgs, system, model) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json", "x-api-key": key,
+        "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({ model, max_tokens: 1024, system, messages: msgs }),
+    });
+    if (!res.ok) throw new Error(`APIエラー ${res.status}: ${(await res.text()).slice(0, 160)}`);
+    const json = await res.json();
+    return (json.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+  }
+  async function askGemini(key, msgs, system) {
+    const models = State.data.settings.geminiModel
+      ? [State.data.settings.geminiModel]
+      : ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"];
+    const body = JSON.stringify({
+      systemInstruction: { parts: [{ text: system }] },
+      contents: msgs.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })),
+    });
+    let lastErr = null;
+    for (const model of models) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
+      const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body });
+      if (res.status === 404) { lastErr = `モデル ${model} は利用不可`; continue; }
+      if (!res.ok) throw new Error(`Geminiエラー ${res.status}: ${(await res.text()).slice(0, 160)}`);
+      const json = await res.json();
+      const text = ((json.candidates || [])[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+      if (!text) throw new Error("応答が空でした（無料枠の上限などをご確認ください）");
+      return text;
+    }
+    throw new Error(`利用可能なGeminiモデルが見つかりません（${lastErr || "不明"}）`);
+  }
+  // AIに渡す「あなたの状況」コンテキスト
+  function buildContext() {
+    const p = State.data.profile;
+    const log = State.log(todayStr());
+    const t = dayTotals(log);
+    const b = Metrics.burned(p, log.activity);
+    const target = Metrics.targetIntake(p, b.total);
+    const nt = Metrics.nutrientTargets(p, target);
+    const goal = GOALS.find((g) => g.key === p.goal) || GOALS[1];
+    const wk = weeklyBody(7);
+    const proj = weightProjection(30);
+    return [
+      `【利用者プロフィール】${p.sex === "male" ? "男性" : "女性"} ${p.age}歳 身長${p.height}cm 体重${p.weight}kg`,
+      `BMI ${fmt(Metrics.bmi(p), 1)} / 基礎代謝 ${fmt(Metrics.bmr(p))}kcal / 目的「${goal.name}」${p.targetWeight ? ` / 目標体重${p.targetWeight}kg` : ""}`,
+      `【今日の摂取】合計${fmt(t.all.kcal)}kcal（朝${fmt(t.slots.breakfast.kcal)}/昼${fmt(t.slots.lunch.kcal)}/晩${fmt(t.slots.dinner.kcal)}/間食${fmt(t.slots.snack.kcal)}）`,
+      `たんぱく質${fmt(t.all.p)}g(目標${fmt(nt.protein)}g) 脂質${fmt(t.all.f)}g 炭水化物${fmt(t.all.c)}g 食物繊維${fmt(t.all.fiber)}g(目標${fmt(nt.fiber)}g) 塩分${fmt(t.all.salt, 1)}g(上限${fmt(nt.saltMax, 1)}g)`,
+      `【今日の消費】${fmt(b.total)}kcal（基礎代謝${fmt(b.bmr)}/生活${fmt(b.neat)}/歩数${fmt(log.activity.steps)}歩=${fmt(b.stepKcal)}/運動${fmt(b.exKcal)}）`,
+      `【目標摂取】${fmt(target)}kcal（残り${fmt(target - t.all.kcal)}kcal）`,
+      `【直近7日】平均睡眠${wk.sleepAvg != null ? fmt(wk.sleepAvg, 1) + "h" : "未記録"} / 平均水分${wk.waterAvg != null ? fmt(wk.waterAvg) + "ml" : "未記録"} / 飲酒${wk.alcoholDays}日 / コーヒー${fmt(wk.coffee)}杯`,
+      proj ? `【体重傾向】${proj.perMonth >= 0 ? "+" : ""}${fmt(proj.perMonth, 1)}kg/月のペース` : "",
+      `【今日食べたもの】${MEAL_SLOTS.map((s) => (log.meals[s.key] || []).map((i) => i.name).join("、")).filter(Boolean).join(" / ") || "まだ記録なし"}`,
+    ].filter(Boolean).join("\n");
+  }
+  const AI_SYSTEM = "あなたは経験豊富な管理栄養士・健康アドバイザーです。利用者の実データにもとづき、"
+    + "日本の食生活に合わせた具体的で実行しやすい助言を、簡潔な日本語で行ってください。"
+    + "医療行為の断定は避け、必要なら受診を促してください。回答は300字程度、箇条書きを活用してください。";
+
+  function showPhotoResult(items, slot, modal, statusEl, resultEl) {
+    if (!items.length) { statusEl.innerHTML = `<p class="muted">料理を検出できませんでした。</p>`; return; }
+    statusEl.innerHTML = `<p class="good-box">✅ ${items.length}品を検出しました。内容を確認して追加してください。</p>`;
+    resultEl.innerHTML = items.map((it, i) => `
+      <div class="ph-card">
+        <div class="row between"><strong>${it.name || "料理"}</strong><span>${fmt(it.kcal || 0)}kcal</span></div>
+        <div class="ph-macros">P ${fmt(it.p || 0, 1)}g / F ${fmt(it.f || 0, 1)}g / C ${fmt(it.c || 0, 1)}g ・ 食物繊維 ${fmt(it.fiber || 0, 1)}g ・ 塩分 ${fmt(it.salt || 0, 1)}g</div>
+        ${it.ingredients && it.ingredients.length ? `<div class="muted">食材: ${it.ingredients.join("、")}</div>` : ""}
+        <button class="btn sm primary" data-add="${i}">＋ ${slot.label}に追加</button>
+      </div>`).join("");
+    $$("[data-add]", resultEl).forEach((b) => {
+      b.onclick = () => {
+        const it = items[parseInt(b.dataset.add, 10)];
+        State.log(recordDate).meals[slot.key].push({
+          name: it.name || "料理", unit: "AI推定 1食",
+          kcal: it.kcal || 0, p: it.p || 0, f: it.f || 0, c: it.c || 0,
+          fiber: it.fiber || 0, salt: it.salt || 0, qty: 1, at: Date.now(),
+        });
+        addCustomFood(it); // 次回から「料理を選ぶ」候補にも表示
+        State.save();
+        b.textContent = "追加済み ✓"; b.disabled = true;
+        render();
+      };
+    });
+  }
+
+  // ==========================================================================
+  //  からだタブ（水分・睡眠・血圧・血糖・体組成・断食・予測）
+  // ==========================================================================
+  let bodyDate = todayStr();
+  function renderBody(view) {
+    const p = State.data.profile;
+    const log = State.log(bodyDate);
+    const isToday = bodyDate === todayStr();
+    const wt = waterTarget();
+    const wPct = Math.min(100, (log.water / wt) * 100);
+    const wk = weeklyBody(7);
+    const proj = weightProjection(30);
+    const streak = streakDays();
+    const lastMeal = lastMealAt();
+    const fastH = lastMeal ? (Date.now() - lastMeal) / 3600000 : null;
+
+    view.innerHTML = `
+      <section class="card">
+        <div class="row between wrap">
+          <h2>からだの記録</h2>
+          <div class="row wrap" style="gap:8px">
+            <input type="date" id="bd-date" value="${bodyDate}" max="${todayStr()}">
+            ${isToday ? "" : `<button class="btn sm" id="bd-today">今日に戻る</button>`}
+          </div>
+        </div>
+
+        <div class="kpi-grid">
+          <div class="kpi ${streak >= 3 ? "good" : ""}"><div class="kpi-l">連続記録</div><div class="kpi-v">${streak}<small>日</small></div></div>
+          ${isToday && fastH != null ? `<div class="kpi ${fastH >= 12 ? "good" : "info"}"><div class="kpi-l">最後の食事から</div><div class="kpi-v">${fmt(fastH, 1)}<small>時間</small></div></div>` : ""}
+          ${proj ? `<div class="kpi ${proj.perMonth < 0 ? "good" : proj.perMonth > 0.5 ? "bad" : "warn"}">
+            <div class="kpi-l">1ヶ月後の予測体重</div><div class="kpi-v">${fmt(proj.predicted, 1)}<small>kg</small></div>
+            <div class="muted">${proj.perMonth >= 0 ? "+" : ""}${fmt(proj.perMonth, 1)}kg/月</div></div>` : ""}
+        </div>
+        ${proj && proj.etaDays != null && proj.etaDays <= 730
+          ? `<p class="good-box">このペースなら目標体重(${p.targetWeight}kg)まで約 <b>${proj.etaDays}日</b>（約${fmt(proj.etaDays / 30, 1)}ヶ月）です。</p>` : ""}
+      </section>
+
+      <section class="card">
+        <h3>💧 水分</h3>
+        <div class="balrow">
+          <span class="bl">${fmt(log.water)}<small>ml</small></span>
+          <div class="track"><div class="fill ${log.water >= wt ? "tone-info" : "tone-warn"}" style="width:${wPct}%"></div></div>
+          <span class="bv">/${fmt(wt)}</span>
+        </div>
+        <div class="row wrap" style="margin-top:10px">
+          <button class="btn sm" data-water="200">＋200ml</button>
+          <button class="btn sm" data-water="350">＋350ml</button>
+          <button class="btn sm" data-water="500">＋500ml</button>
+          <button class="btn sm danger" data-water="reset">リセット</button>
+        </div>
+        <p class="muted">目安は体重×35ml（あなたは約${fmt(wt)}ml/日）。コーヒー・お茶も水分に含めて構いません。</p>
+      </section>
+
+      <section class="card">
+        <h3>😴 睡眠・体組成・採寸</h3>
+        <div class="form-grid">
+          <label>睡眠時間 (時間)<input type="number" id="bd-sleep" value="${log.sleep ?? ""}" min="0" max="24" step="0.5" placeholder="例: 7"></label>
+          <label>体脂肪率 (%)<input type="number" id="bd-fat" value="${log.bodyFat ?? ""}" min="3" max="60" step="0.1" placeholder="任意"></label>
+          <label>ウエスト (cm)<input type="number" id="bd-waist" value="${log.waist ?? ""}" min="40" max="200" step="0.1" placeholder="任意"></label>
+        </div>
+        <h3 class="mt">🩺 血圧・血糖値</h3>
+        <div class="form-grid">
+          <label>血圧 上 (mmHg)<input type="number" id="bd-sys" value="${log.bp ? log.bp.sys : ""}" min="60" max="250" placeholder="例: 120"></label>
+          <label>血圧 下 (mmHg)<input type="number" id="bd-dia" value="${log.bp ? log.bp.dia : ""}" min="40" max="150" placeholder="例: 78"></label>
+          <label>血糖値 (mg/dL)<input type="number" id="bd-glu" value="${log.glucose ?? ""}" min="40" max="500" placeholder="任意"></label>
+        </div>
+        ${log.bp ? bpComment(log.bp) : ""}
+        ${log.glucose != null ? glucoseComment(log.glucose) : ""}
+        ${p.sex === "female" ? `
+          <h3 class="mt">🌸 生理周期</h3>
+          <div class="form-grid">
+            <label>最終開始日<input type="date" id="bd-cycle" value="${State.data.settings.cycleStart || ""}" max="${todayStr()}"></label>
+            <label>周期の長さ (日)<input type="number" id="bd-cyclen" value="${State.data.settings.cycleLen || 28}" min="20" max="45"></label>
+          </div>
+          ${cyclePhase()}` : ""}
+        <button class="btn primary block" id="bd-save">からだの記録を保存</button>
+      </section>
+
+      <section class="card">
+        <h3>📅 直近7日のサマリー</h3>
+        <div class="breakdown">
+          <span>平均睡眠 <b>${wk.sleepAvg != null ? fmt(wk.sleepAvg, 1) + "h" : "—"}</b></span>
+          <span>平均水分 <b>${wk.waterAvg != null ? fmt(wk.waterAvg) + "ml" : "—"}</b></span>
+          <span>飲酒 <b>${wk.alcoholDays}日</b>${wk.alcoholKcal ? `(${fmt(wk.alcoholKcal)}kcal)` : ""}</span>
+          <span>コーヒー <b>${fmt(wk.coffee)}杯</b></span>
+        </div>
+        ${bodyAdvice(wk, log)}
+      </section>`;
+
+    $("#bd-date").onchange = (e) => { bodyDate = e.target.value; renderBody(view); };
+    const bt = $("#bd-today"); if (bt) bt.onclick = () => { bodyDate = todayStr(); renderBody(view); };
+    $$("[data-water]").forEach((b) => (b.onclick = () => {
+      const v = b.dataset.water;
+      log.water = v === "reset" ? 0 : (log.water || 0) + parseInt(v, 10);
+      State.save(); renderBody(view);
+    }));
+    $("#bd-save").onclick = () => {
+      const num = (id) => { const v = parseFloat($(id).value); return v > 0 ? v : null; };
+      log.sleep = num("#bd-sleep"); log.bodyFat = num("#bd-fat"); log.waist = num("#bd-waist");
+      const sys = num("#bd-sys"), dia = num("#bd-dia");
+      log.bp = sys && dia ? { sys, dia } : null;
+      log.glucose = num("#bd-glu");
+      if ($("#bd-cycle")) {
+        State.data.settings.cycleStart = $("#bd-cycle").value || null;
+        State.data.settings.cycleLen = parseInt($("#bd-cyclen").value, 10) || 28;
+      }
+      State.save(); alert("保存しました。"); renderBody(view);
+    };
+  }
+  function bpComment(bp) {
+    let tone = "good", msg = "正常範囲です。";
+    if (bp.sys >= 140 || bp.dia >= 90) { tone = "bad"; msg = "高血圧の範囲です。減塩を意識し、継続する場合は受診を検討してください。"; }
+    else if (bp.sys >= 130 || bp.dia >= 85) { tone = "warn"; msg = "やや高めです。塩分と体重の管理を。"; }
+    return `<div class="advice-item ${tone}"><span class="ai-icon">${adviceIcon(tone)}</span><span>血圧 ${bp.sys}/${bp.dia} — ${msg}</span></div>`;
+  }
+  function glucoseComment(g) {
+    let tone = "good", msg = "正常範囲です（空腹時基準）。";
+    if (g >= 126) { tone = "bad"; msg = "高い値です。糖質量の見直しと受診を検討してください。"; }
+    else if (g >= 110) { tone = "warn"; msg = "境界域です。主食量や間食のとり方を見直しましょう。"; }
+    return `<div class="advice-item ${tone}"><span class="ai-icon">${adviceIcon(tone)}</span><span>血糖値 ${g}mg/dL — ${msg}</span></div>`;
+  }
+  function cyclePhase() {
+    const s = State.data.settings;
+    if (!s.cycleStart) return `<p class="muted">最終開始日を入れると、周期に応じた体重変動の目安を表示します。</p>`;
+    const len = s.cycleLen || 28;
+    const day = Math.floor((new Date(todayStr()) - new Date(s.cycleStart)) / 86400000) % len + 1;
+    let phase = "卵胞期", note = "代謝が上がりやすく、減量に取り組みやすい時期です。";
+    if (day <= 5) { phase = "月経期"; note = "鉄分を意識し、無理な制限は避けましょう。"; }
+    else if (day >= len - 7) { phase = "黄体期"; note = "水分を溜めやすく体重が0.5〜1.5kg増えて見えることがあります。数値に一喜一憂しないで大丈夫です。"; }
+    return `<div class="advice-item info"><span class="ai-icon">🌸</span><span>周期${day}日目（${phase}）— ${note}</span></div>`;
+  }
+  function bodyAdvice(wk, log) {
+    const a = [];
+    if (wk.sleepAvg != null && wk.sleepAvg < 6.5) a.push(["warn", "睡眠が平均6.5時間未満です。睡眠不足は食欲ホルモンを乱し、間食が増えやすくなります。"]);
+    if (wk.waterAvg != null && wk.waterAvg < waterTarget() * 0.7) a.push(["warn", "水分がやや不足気味です。こまめな摂取が代謝と満腹感の助けになります。"]);
+    if (wk.alcoholDays >= 5) a.push(["warn", `飲酒が7日中${wk.alcoholDays}日あります。週2日以上の休肝日をつくりましょう。`]);
+    if (wk.coffee >= 21) a.push(["info", "コーヒーが1日平均3杯以上です。夕方以降は睡眠に影響することがあります。"]);
+    if (!a.length) a.push(["good", "睡眠・水分・嗜好品のバランスは良好です。この習慣を維持しましょう。"]);
+    return a.map(([t, m]) => `<div class="advice-item ${t}"><span class="ai-icon">${adviceIcon(t)}</span><span>${m}</span></div>`).join("");
+  }
+
+  // ==========================================================================
+  //  ダッシュボード（分析・アドバイス）
+  // ==========================================================================
+  function renderDashboard(view) {
+    const p = State.data.profile;
+    const date = dashDate;
+    const isToday = date === todayStr();
+    const log = State.log(date);
+    const totals = dayTotals(log);
+    const burned = Metrics.burned(p, log.activity);
+    const target = Metrics.targetIntake(p, burned.total);
+    const nt = Metrics.nutrientTargets(p, target);
+    const balance = totals.all.kcal - burned.total; // 摂取 − 消費
+    const bmi = Metrics.bmi(p);
+    const cat = Metrics.bmiCategory(bmi);
+
+    // 目標に対する残り: 余裕あり=青(info) / 近づいたら黄(warn) / 超えたら赤(bad)
+    const remaining = target - totals.all.kcal;
+    const near = Math.max(150, target * 0.1);
+    const balTone = remaining < 0 ? "bad" : remaining < near ? "warn" : "info";
+    const balLabel = remaining < 0 ? "目標オーバー" : "目標まで残り";
+
+    view.innerHTML = `
+      <section class="card">
+        <div class="row between wrap">
+          <h2>${isToday ? "今日" : "この日"}の分析</h2>
+          <span class="badge ${cat.tone}">BMI ${fmt(bmi, 1)}・${cat.label}</span>
+        </div>
+        <div class="row wrap" style="gap:8px;margin:6px 0 12px">
+          <input type="date" id="dash-date" value="${date}" max="${todayStr()}">
+          ${isToday ? "" : `<button class="btn sm" id="dash-today">今日に戻る</button>`}
+          <button class="btn sm ai" id="dash-recipe">🍽 残りで何食べる？</button>
+        </div>
+        ${isToday ? mealNudge(log) : ""}
+
+        <div class="kpi-grid">
+          <div class="kpi"><div class="kpi-l">摂取カロリー</div><div class="kpi-v">${fmt(totals.all.kcal)}<small>kcal</small></div></div>
+          <div class="kpi"><div class="kpi-l">消費カロリー</div><div class="kpi-v">${fmt(burned.total)}<small>kcal</small></div></div>
+          <div class="kpi"><div class="kpi-l">目標摂取</div><div class="kpi-v">${fmt(target)}<small>kcal</small></div></div>
+          <div class="kpi ${balTone}"><div class="kpi-l">${balLabel}</div>
+            <div class="kpi-v">${remaining < 0 ? "+" : ""}${fmt(Math.abs(remaining))}<small>kcal</small></div>
+            <div class="muted">収支 ${balance >= 0 ? "+" : ""}${fmt(balance)}</div></div>
+        </div>
+
+        ${renderBalanceBar(totals.all.kcal, burned.total, target, balTone)}
+
+        <h3 class="mt">からだ・継続</h3>
+        <div class="breakdown">
+          <span>連続記録 <b>${streakDays()}日</b></span>
+          <span>水分 <b>${fmt(log.water)}/${fmt(waterTarget())}ml</b></span>
+          ${log.sleep != null ? `<span>睡眠 <b>${fmt(log.sleep, 1)}h</b></span>` : ""}
+          ${(() => { const lm = lastMealAt(); return isToday && lm ? `<span>最後の食事から <b>${fmt((Date.now() - lm) / 3600000, 1)}h</b></span>` : ""; })()}
+        </div>
+
+        <h3 class="mt">消費の内訳</h3>
+        <div class="breakdown">
+          <span>基礎代謝 <b>${fmt(burned.bmr)}</b></span>
+          <span>生活活動 <b>${fmt(burned.neat)}</b></span>
+          <span>歩数(${fmt(log.activity.steps)}歩) <b>${fmt(burned.stepKcal)}</b></span>
+          <span>運動 <b>${fmt(burned.exKcal)}</b></span>
+        </div>
+      </section>
+
+      <section class="card">
+        <h3>栄養バランス（過不足）</h3>
+        ${renderNutrientBars(totals.all, nt)}
+      </section>
+
+      <section class="card advice">
+        <h3>💡 健康アドバイス</h3>
+        ${renderAdvice(p, totals, burned, target, nt, balance, date)}
+      </section>
+
+      <section class="card">
+        <div class="row between"><h3>食事バランス(PFC)</h3></div>
+        ${renderPFC(totals.all)}
+      </section>`;
+    $("#dash-date").onchange = (e) => { dashDate = e.target.value; renderDashboard(view); };
+    const backBtn = $("#dash-today");
+    if (backBtn) backBtn.onclick = () => { dashDate = todayStr(); renderDashboard(view); };
+    $("#dash-recipe").onclick = () => openRecipeSuggest(dashDate);
+    const nb = $("#nudge-go"); if (nb) nb.onclick = () => Nav.go("record");
+  }
+  // 未記録の食事をやさしく促すバナー（時刻を過ぎた食事だけ対象）
+  function mealNudge(log) {
+    if (State.data.settings.nudge === false) return "";
+    const h = new Date().getHours();
+    const due = [["breakfast", "朝食", 10], ["lunch", "昼食", 14], ["dinner", "夕食", 21]];
+    const missing = due.filter(([k, , t]) => h >= t && !(log.meals[k] || []).length).map(([, l]) => l);
+    if (!missing.length) return "";
+    return `<div class="nudge">🔔 <b>${missing.join("・")}</b> がまだ記録されていません。
+      <button class="btn sm" id="nudge-go">記録する</button></div>`;
+  }
+
+  function renderBalanceBar(intake, burned, target, tone) {
+    const max = Math.max(intake, burned, target, 1) * 1.1;
+    const w = (v) => `${Math.min(100, (v / max) * 100)}%`;
+    return `
+      <div class="balbar">
+        <div class="balrow"><span class="bl">摂取</span><div class="track"><div class="fill intake tone-${tone || "warn"}" style="width:${w(intake)}"></div></div><span class="bv">${fmt(intake)}</span></div>
+        <div class="balrow"><span class="bl">消費</span><div class="track"><div class="fill burn" style="width:${w(burned)}"></div></div><span class="bv">${fmt(burned)}</span></div>
+        <div class="balrow"><span class="bl">目標</span><div class="track"><div class="fill target" style="width:${w(target)}"></div></div><span class="bv">${fmt(target)}</span></div>
+      </div>`;
+  }
+
+  function renderNutrientBars(all, nt) {
+    const rows = [
+      { l: "たんぱく質", v: all.p, t: nt.protein, u: "g", type: "min" },
+      { l: "脂質", v: all.f, t: nt.fat, u: "g", type: "range" },
+      { l: "炭水化物", v: all.c, t: nt.carb, u: "g", type: "range" },
+      { l: "食物繊維", v: all.fiber, t: nt.fiber, u: "g", type: "min" },
+      { l: "食塩相当量", v: all.salt, t: nt.saltMax, u: "g", type: "max" },
+    ];
+    return `<div class="nut">${rows.map((r) => {
+      const pct = Math.min(150, (r.v / r.t) * 100);
+      let tone = "good", note = "適量";
+      if (r.type === "min") {
+        if (r.v < r.t * 0.8) { tone = "warn"; note = `あと ${fmt(r.t - r.v, 1)}${r.u}`; }
+        else note = "十分";
+      } else if (r.type === "max") {
+        if (r.v > r.t) { tone = "bad"; note = `${fmt(r.v - r.t, 1)}${r.u} 超過`; }
+        else note = `上限まで ${fmt(r.t - r.v, 1)}${r.u}`;
+      } else {
+        if (r.v > r.t * 1.2) { tone = "warn"; note = "やや多い"; }
+        else if (r.v < r.t * 0.7) { tone = "warn"; note = "やや少ない"; }
+      }
+      return `<div class="nut-row">
+        <div class="nut-l">${r.l}</div>
+        <div class="nut-track"><div class="nut-fill ${tone}" style="width:${Math.min(100, pct)}%"></div>
+          ${r.type === "max" ? `<div class="nut-limit" style="left:100%"></div>` : ""}</div>
+        <div class="nut-v">${fmt(r.v, 1)}/${fmt(r.t, r.type === "max" ? 1 : 0)}${r.u}<span class="badge ${tone} sm">${note}</span></div>
+      </div>`;
+    }).join("")}</div>`;
+  }
+
+  function renderPFC(all) {
+    const pk = all.p * 4, fk = all.f * 9, ck = all.c * 4;
+    const tot = pk + fk + ck || 1;
+    const seg = (v, cls, label) => `<div class="pfc-seg ${cls}" style="width:${(v / tot) * 100}%" title="${label}"></div>`;
+    return `
+      <div class="pfc-bar">${seg(pk, "p", "P")}${seg(fk, "f", "F")}${seg(ck, "c", "C")}</div>
+      <div class="pfc-legend">
+        <span><i class="dot p"></i>たんぱく質 ${fmt(pk / tot * 100)}%</span>
+        <span><i class="dot f"></i>脂質 ${fmt(fk / tot * 100)}%</span>
+        <span><i class="dot c"></i>炭水化物 ${fmt(ck / tot * 100)}%</span>
+      </div>
+      <p class="muted">理想の目安 P:F:C ≒ 15:25:60（%エネルギー）</p>`;
+  }
+
+  // ---- アドバイス生成エンジン（ルールベース） -----------------------------
+  function renderAdvice(p, totals, burned, target, nt, balance, date) {
+    const a = [];
+    const all = totals.all;
+    const remaining = target - all.kcal; // 目標までの残り
+    const loggedMeals = MEAL_SLOTS.filter((s) => totals.slots[s.key].kcal > 0);
+
+    // 1. 目標に対する残り（主指標）
+    if (all.kcal === 0) {
+      a.push(["info", "まだ食事が記録されていません。「記録する」から今日の食事を追加すると分析が始まります。"]);
+    } else if (remaining < 0) {
+      a.push(["bad", `目標(${fmt(target)}kcal)を <b>${fmt(-remaining)}kcal</b> 超えています。今日はこれ以上の食事を控え、軽い運動でリカバリーしましょう。`]);
+    } else if (remaining < Math.max(150, target * 0.1)) {
+      a.push(["warn", `目標まであと <b>${fmt(remaining)}kcal</b> と残りわずかです。次に食べるなら、汁物やサラダなど軽いものを選びましょう。`]);
+    } else {
+      a.push(["info", `目標まであと <b>${fmt(remaining)}kcal</b> 食べられます。バランスよく配分しましょう。`]);
+    }
+    // 2. 体重変化のペース（摂取−消費）
+    if (all.kcal > 0) {
+      if (balance > 300) {
+        a.push(["warn", `摂取が消費を <b>${fmt(balance)}kcal</b> 上回っています。この状態が続くと約 ${fmt(balance * 30 / 7200, 1)}kg/月 の増加ペースです。`]);
+      } else if (balance < -700) {
+        a.push(["warn", `消費が摂取を <b>${fmt(-balance)}kcal</b> 上回っています。極端な不足は筋肉量の低下につながるため、たんぱく質は確保しましょう。`]);
+      } else if (balance < 0) {
+        a.push(["good", `カロリー収支は <b>${fmt(balance)}kcal</b>。約 ${fmt(-balance * 30 / 7200, 1)}kg/月 の減量ペースです。`]);
+      }
+    }
+
+    // 2. たんぱく質
+    if (all.p < nt.protein * 0.8 && all.kcal > 0) {
+      a.push(["warn", `たんぱく質が不足気味（${fmt(all.p, 0)}/${fmt(nt.protein, 0)}g）。<b>鶏むね肉・刺身・納豆・卵</b>などを足すと効率よく補えます。`]);
+    }
+    // 3. 脂質
+    if (all.f > nt.fat * 1.3) {
+      a.push(["warn", `脂質が多め（${fmt(all.f, 0)}g）。揚げ物や脂身を控え、蒸す・焼く調理に変えると抑えられます。`]);
+    }
+    // 4. 塩分
+    if (all.salt > nt.saltMax) {
+      a.push(["bad", `塩分が上限を <b>${fmt(all.salt - nt.saltMax, 1)}g</b> 超過。汁物を半量にする、麺類の汁を残すなどで減塩を。高血圧予防に重要です。`]);
+    }
+    // 5. 食物繊維
+    if (all.fiber < nt.fiber * 0.7 && all.kcal > 0) {
+      a.push(["warn", `食物繊維が不足（${fmt(all.fiber, 0)}/${fmt(nt.fiber, 0)}g）。<b>野菜・海藻・きのこ・玄米</b>を意識すると腸内環境と血糖コントロールに役立ちます。`]);
+    }
+
+    // 6. 次の食事は何を食べたら良いか
+    a.push(["info", nextMealSuggestion(all, nt, remaining, loggedMeals)]);
+
+    // 7. 体重トレンド
+    const trend = weightTrend(date, 7);
+    if (trend) a.push([trend.tone, trend.msg]);
+
+    return a.map(([tone, msg]) => `<div class="advice-item ${tone}"><span class="ai-icon">${adviceIcon(tone)}</span><span>${msg}</span></div>`).join("");
+  }
+  function adviceIcon(t) { return { good: "✅", warn: "⚠️", bad: "🚫", info: "🍽️" }[t] || "•"; }
+
+  function nextMealSuggestion(all, nt, remaining, loggedMeals) {
+    const nextSlot = MEAL_SLOTS.find((s) => !loggedMeals.some((m) => m.key === s.key) && s.key !== "snack");
+    const slotName = nextSlot ? nextSlot.label : "次の食事";
+    const needs = [];
+    if (all.p < nt.protein * 0.8) needs.push("たんぱく質");
+    if (all.fiber < nt.fiber * 0.7) needs.push("食物繊維");
+    const picks = [];
+    if (needs.includes("たんぱく質")) picks.push("焼き鮭・鶏むね肉・冷奴");
+    if (needs.includes("食物繊維")) picks.push("野菜炒め・ひじきの煮物・きのこソテー");
+    if (remaining < 200 && all.kcal > 0) {
+      return `<b>${slotName}の提案:</b> 目標までの残りは <b>${fmt(remaining)}kcal</b> と少なめ。味噌汁＋サラダ＋豆腐など、低カロリー高たんぱくで軽めにまとめましょう。`;
+    }
+    if (picks.length) {
+      return `<b>${slotName}の提案:</b> 残り約 <b>${fmt(Math.max(remaining, 0))}kcal</b>。不足しがちな${needs.join("・")}を補うため、${picks.join(" / ")} などがおすすめです。`;
+    }
+    return `<b>${slotName}の提案:</b> 残り約 <b>${fmt(Math.max(remaining, 0))}kcal</b>。主食・主菜・副菜をそろえ、野菜を1品加えるとバランスが整います。`;
+  }
+
+  function weightTrend(date, days) {
+    const logs = State.data.logs;
+    const series = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(date); d.setDate(d.getDate() - i);
+      const k = d.toISOString().slice(0, 10);
+      if (logs[k] && logs[k].weight != null) series.push(logs[k].weight);
+    }
+    if (series.length < 2) return null;
+    const diff = series[series.length - 1] - series[0];
+    const p = State.data.profile;
+    if (p.targetWeight) {
+      const toGo = p.weight - p.targetWeight;
+      if (Math.abs(toGo) < 0.3) return { tone: "good", msg: `🎉 目標体重(${p.targetWeight}kg)を達成しています。今のペースを維持しましょう。` };
+    }
+    if (Math.abs(diff) < 0.3) return { tone: "info", msg: `直近${series.length}回の体重はほぼ横ばい（${diff >= 0 ? "+" : ""}${fmt(diff, 1)}kg）。` };
+    return {
+      tone: diff < 0 ? "good" : "warn",
+      msg: `直近の体重は <b>${diff > 0 ? "+" : ""}${fmt(diff, 1)}kg</b> ${diff < 0 ? "減少傾向。順調です。" : "増加傾向。摂取と運動を見直しましょう。"}`,
+    };
+  }
+
+  // ==========================================================================
+  //  AI相談タブ
+  // ==========================================================================
+  const QUICK_ASKS = [
+    "今日の食事内容を評価して、改善点を教えて",
+    "次の食事は何を食べたらいい？",
+    "この1週間の傾向を分析して",
+    "外食が続くときの選び方を教えて",
+    "減量が停滞しているときの対処法は？",
+  ];
+  function renderChat(view) {
+    const chat = State.data.chat || [];
+    const hasKey = !!activeKey();
+    view.innerHTML = `
+      <section class="card">
+        <div class="row between wrap">
+          <h2>💬 AIに相談</h2>
+          ${chat.length ? `<button class="btn sm" id="ch-clear">履歴を消す</button>` : ""}
+        </div>
+        <p class="muted">あなたの記録（体重・BMI・今日の摂取と消費・栄養の過不足・直近の傾向）をふまえて回答します。</p>
+        ${hasKey ? "" : `<p class="warn-box">⚠️ 設定タブでAPIキーを登録すると利用できます（無料のGoogle Geminiも選べます）。</p>`}
+
+        <div class="row wrap" style="margin:10px 0">
+          <button class="btn sm primary" id="ch-recipe">🍽 残りカロリーでレシピ提案</button>
+        </div>
+        <div class="row wrap">
+          ${QUICK_ASKS.map((q, i) => `<button class="btn sm" data-ask="${i}">${q}</button>`).join("")}
+        </div>
+
+        <div id="ch-log" class="chat-log">
+          ${chat.length ? chat.map((m) => `<div class="msg ${m.role}">${escapeHtml(m.content).replace(/\n/g, "<br>")}</div>`).join("")
+            : `<p class="muted">上のボタンから聞くか、下に自由に質問を入力してください。</p>`}
+        </div>
+        <div class="row" style="margin-top:10px">
+          <input type="text" id="ch-input" placeholder="例: 夜遅い食事でも太りにくくするには？" autocomplete="off">
+          <button class="btn primary" id="ch-send">送信</button>
+        </div>
+      </section>`;
+
+    const send = async (text) => {
+      if (!text) return;
+      if (!activeKey()) { alert("設定タブでAPIキーを登録してください。"); return; }
+      State.data.chat = (State.data.chat || []).concat({ role: "user", content: text }).slice(-40);
+      State.save(); renderChat(view);
+      const logEl = $("#ch-log");
+      logEl.insertAdjacentHTML("beforeend", `<div class="msg assistant loading" id="ch-wait">🤖 考えています…</div>`);
+      logEl.scrollTop = logEl.scrollHeight;
+      try {
+        // 過去のやり取り → 今回の質問 の順に並べる（user/assistantが交互になるように）
+        const history = (State.data.chat || []).slice(0, -1)
+          .filter((m) => !(m.role === "assistant" && m.content.startsWith("⚠️")))
+          .slice(-6);
+        while (history.length && history[0].role !== "user") history.shift();
+        while (history.length && history[history.length - 1].role !== "assistant") history.pop();
+        const answer = await askAI(
+          history.map((m) => ({ role: m.role, content: m.content }))
+            .concat([{ role: "user", content: `${buildContext()}\n\n【質問】${text}` }]),
+          AI_SYSTEM);
+        State.data.chat = (State.data.chat || []).concat({ role: "assistant", content: answer }).slice(-40);
+        State.save();
+      } catch (e) {
+        State.data.chat = (State.data.chat || []).concat({ role: "assistant", content: `⚠️ ${e.message}` }).slice(-40);
+        State.save();
+      }
+      renderChat(view);
+      const l2 = $("#ch-log"); if (l2) l2.scrollTop = l2.scrollHeight;
+    };
+    $("#ch-send").onclick = () => { const el = $("#ch-input"); const v = el.value.trim(); el.value = ""; send(v); };
+    $("#ch-input").onkeydown = (e) => { if (e.key === "Enter") $("#ch-send").click(); };
+    $$("[data-ask]").forEach((b) => (b.onclick = () => send(QUICK_ASKS[parseInt(b.dataset.ask, 10)])));
+    $("#ch-recipe").onclick = () => openRecipeSuggest();
+    const cl = $("#ch-clear"); if (cl) cl.onclick = () => { State.data.chat = []; State.save(); renderChat(view); };
+    const lg = $("#ch-log"); if (lg) lg.scrollTop = lg.scrollHeight;
+  }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+  }
+
+  // ---- 残りカロリーからのレシピ提案 ---------------------------------------
+  // 内蔵DBから「主食＋主菜＋副菜」の組み合わせを作り、残りkcalと不足栄養で採点
+  function suggestCombos(remainKcal, needP, needFiber) {
+    const cands = allFoods();
+    const mains = cands.filter((f) => f.cat === "主食");
+    const dishes = cands.filter((f) => f.cat === "主菜");                    // 献立の主菜
+    const prots = dishes.concat(cands.filter((f) => f.cat === "プロテイン")); // 軽food用（飲料も可）
+    const sides = cands.filter((f) => f.cat === "副菜" || f.cat === "汁物");
+    const out = [];
+    const push = (items) => {
+      const s = items.reduce((a, f) => ({
+        kcal: a.kcal + f.kcal, p: a.p + f.p, f: a.f + f.f,
+        fiber: a.fiber + f.fiber, salt: a.salt + f.salt,
+      }), { kcal: 0, p: 0, f: 0, fiber: 0, salt: 0 });
+      if (s.kcal > remainKcal || s.kcal < remainKcal * 0.55) return;
+      const score = Math.min(s.p, needP) / Math.max(needP, 1) * 2
+        + Math.min(s.fiber, needFiber) / Math.max(needFiber, 1)
+        - s.salt * 0.09 - Math.abs(remainKcal - s.kcal) / Math.max(remainKcal, 1) * 0.5;
+      out.push({ items, ...s, score });
+    };
+    if (remainKcal >= 450) {
+      mains.forEach((m) => dishes.forEach((pr) => sides.forEach((sd) => push([m, pr, sd]))));
+    }
+    prots.forEach((pr) => sides.forEach((sd) => push([pr, sd])));          // 軽め（主食なし）
+    prots.forEach((pr) => push([pr]));                                      // 単品
+    out.sort((a, b) => b.score - a.score);
+    const seen = new Set(), top = [];
+    for (const c of out) {
+      const key = c.items.map((i) => i.name).sort().join("|");
+      const head = c.items[0].name;
+      if (seen.has(key) || seen.has(head)) continue;
+      seen.add(key); seen.add(head); top.push(c);
+      if (top.length >= 4) break;
+    }
+    return top;
+  }
+  // 未記録かつ時間的にこれから食べる食事（過去日は未記録すべてが対象）
+  function remainingMeals(log, date) {
+    const h = date === todayStr() ? new Date().getHours() : 0;
+    return [
+      { key: "breakfast", label: "朝食", until: 10 },
+      { key: "lunch", label: "昼食", until: 15 },
+      { key: "dinner", label: "夕食", until: 24 },
+    ].filter((d) => !(log.meals[d.key] || []).length && h < d.until);
+  }
+  const isWeekendDate = (k) => [0, 6].includes(new Date(k + "T00:00:00").getDay());
+  // 過去の記録から、同じ曜日区分(平日/週末)の食事別 平均kcal を求める
+  function mealAvgKcal(date) {
+    const weekend = isWeekendDate(date);
+    const acc = { breakfast: [], lunch: [], dinner: [] };
+    Object.keys(State.data.logs).forEach((k) => {
+      if (k >= date || isWeekendDate(k) !== weekend) return;
+      const l = State.data.logs[k];
+      if (!l || !l.meals) return;
+      Object.keys(acc).forEach((s) => {
+        const items = l.meals[s] || [];
+        if (items.length) acc[s].push(sumItems(items).kcal);
+      });
+    });
+    const out = { weekend };
+    Object.keys(acc).forEach((s) => {
+      out[s] = acc[s].length >= 3 ? acc[s].reduce((a, b) => a + b, 0) / acc[s].length : null;
+      out[s + "N"] = acc[s].length;
+    });
+    return out;
+  }
+  // 各食事の配分の重み（実績優先 → 手動設定 → 既定値）
+  function mealWeights(slots, date, target) {
+    const DEF = { breakfast: 0.25, lunch: 0.375, dinner: 0.375, snack: 1 };
+    const style = State.data.settings.breakfastStyle || "auto";
+    const avg = mealAvgKcal(date);
+    let basis = "既定の配分";
+    return slots.map((s) => {
+      let w = DEF[s.key] * target, src = "既定";
+      if (s.key === "breakfast" && style === "light") { w = 200; src = "設定(軽め)"; }
+      else if (s.key === "breakfast" && style === "solid") { w = 500; src = "設定(しっかり)"; }
+      if (avg[s.key] != null) { w = Math.max(avg[s.key], 50); src = `実績${avg[s.key + "N"]}件`; basis = `あなたの${avg.weekend ? "週末" : "平日"}の記録`; }
+      return { ...s, w, src };
+    }).map((s, _, arr) => ({ ...s, basis: arr.some((x) => x.src.startsWith("実績")) ? basis : "既定/設定の配分" }));
+  }
+  function openRecipeSuggest(dateArg) {
+    const p = State.data.profile;
+    const date = dateArg || todayStr();
+    const log = State.log(date);
+    const t = dayTotals(log);
+    const b = Metrics.burned(p, log.activity);
+    const target = Metrics.targetIntake(p, b.total);
+    const nt = Metrics.nutrientTargets(p, target);
+    const remain = Math.max(0, target - t.all.kcal);
+    const needP = Math.max(0, nt.protein - t.all.p);
+    const needFiber = Math.max(0, nt.fiber - t.all.fiber);
+
+    // 残りを、これから食べる食事へ配分する（実績の食べ方に合わせた重み）
+    const rest = remainingMeals(log, date);
+    const slots = mealWeights(rest.length ? rest : [{ key: "snack", label: "間食" }], date, target);
+    const totalW = slots.reduce((a, s) => a + s.w, 0);
+    let pick = 0; // 提案対象の食事
+
+    const modal = makeModal("🍽 残りカロリーでレシピ提案");
+    const body = $(".modal-body", modal);
+
+    const draw = () => {
+      const s = slots[pick];
+      const share = s.w / totalW;
+      const budget = Math.round(remain * share);
+      const bp = needP * share, bf = needFiber * share;
+      const combos = suggestCombos(budget, bp, bf);
+      body.innerHTML = `
+        <p class="muted">${date === todayStr() ? "今日" : date} の状況：
+          目標 ${fmt(target)}kcal − 摂取 ${fmt(t.all.kcal)}kcal = <b>残り ${fmt(remain)}kcal</b><br>
+          <small>（ダッシュボードの「過不足」は 摂取−消費 で別の指標です）</small></p>
+        <p class="muted">これから食べるのは <b>${slots.map((x) => x.label).join("・")}</b> の${slots.length}回。
+          配分すると <b>${s.label}は約 ${fmt(budget)}kcal</b> が目安です。<br>
+          <small>配分の根拠: ${s.basis}（${slots.map((x) => `${x.label}=${x.src}`).join(" / ")}）</small></p>
+        ${slots.length > 1 ? `<div class="seg" style="margin:8px 0">
+          ${slots.map((x, i) => `<button class="seg-btn ${i === pick ? "active" : ""}" data-slot="${i}">${x.label} ${fmt(Math.round(remain * x.w / totalW))}</button>`).join("")}
+        </div>` : ""}
+        <p class="muted">この食事で補いたい たんぱく質 <b>${fmt(bp)}g</b>／食物繊維 <b>${fmt(bf)}g</b></p>
+        ${budget < 150 ? `<p class="warn-box">配分できるカロリーが少ないため、汁物やサラダなど軽いものが安心です。</p>` : ""}
+        ${combos.length ? combos.map((c, i) => `
+          <div class="ph-card">
+            <div class="row between"><strong>${c.items.map((x) => x.name).join(" ＋ ")}</strong><span>${fmt(c.kcal)}kcal</span></div>
+            <div class="ph-macros">たんぱく質 ${fmt(c.p, 1)}g ・ 食物繊維 ${fmt(c.fiber, 1)}g ・ 塩分 ${fmt(c.salt, 1)}g</div>
+            <div class="row wrap">
+              <button class="btn sm primary" data-add-combo="${i}">${s.label}に記録</button>
+            </div>
+          </div>`).join("") : `<p class="muted">条件に合う組み合わせが見つかりませんでした。</p>`}
+        <div class="row wrap" style="margin-top:12px">
+          <button class="btn sm ai" id="rc-ai">🤖 AIに献立を考えてもらう</button>
+        </div>
+        <div id="rc-ai-out"></div>`;
+
+      $$("[data-slot]", body).forEach((b2) => (b2.onclick = () => { pick = parseInt(b2.dataset.slot, 10); draw(); }));
+      $$("[data-add-combo]", body).forEach((btn) => (btn.onclick = () => {
+        const c = combos[parseInt(btn.dataset.addCombo, 10)];
+        c.items.forEach((f) => State.log(date).meals[s.key].push({ ...f, qty: 1, at: Date.now() }));
+        State.save(); modal.remove(); Nav.go("dashboard");
+      }));
+      $("#rc-ai", body).onclick = async () => {
+        const out = $("#rc-ai-out", body);
+        if (!activeKey()) { out.innerHTML = `<p class="warn-box">設定タブでAPIキーを登録してください。</p>`; return; }
+        out.innerHTML = `<p class="loading">🤖 献立を考えています…</p>`;
+        try {
+          const ans = await askAI([{ role: "user", content: `${buildContext()}\n\n`
+            + `【依頼】本日の残りは${fmt(remain)}kcalで、これから${slots.map((x) => x.label).join("・")}の${slots.length}回の食事があります。`
+            + `そのうち「${s.label}」の献立を2案。1案あたり${fmt(budget)}kcal以内に収め、`
+            + `たんぱく質${fmt(bp)}g・食物繊維${fmt(bf)}g程度を補えるようにしてください。`
+            + `各案は料理名・目安量・推定カロリーを箇条書きで、作り方は1〜2行で簡潔に。` }], AI_SYSTEM);
+          out.innerHTML = `<div class="ph-card">${escapeHtml(ans).replace(/\n/g, "<br>")}</div>`;
+        } catch (e) { out.innerHTML = `<p class="warn-box">${e.message}</p>`; }
+      };
+    };
+    draw();
+  }
+
+  // ==========================================================================
+  //  推移グラフ（日・週・月・年）
+  // ==========================================================================
+  let trendPeriod = "day";
+  let chartGeom = null;
+  function renderTrend(view) {
+    view.innerHTML = `
+      <section class="card">
+        <div class="row between wrap">
+          <h2>推移グラフ</h2>
+          <div class="seg">
+            ${[["day", "日"], ["week", "週"], ["month", "月"], ["year", "年"]].map(([k, l]) =>
+              `<button class="seg-btn ${trendPeriod === k ? "active" : ""}" data-p="${k}">${l}</button>`).join("")}
+          </div>
+        </div>
+        <p class="muted">摂取カロリー（朝・昼・晩・間食の積み上げ）と消費カロリー、体重変化を並べて可視化します。</p>
+        <div class="chart-legend">
+          <span><i class="dot br"></i>朝</span><span><i class="dot lu"></i>昼</span>
+          <span><i class="dot di"></i>晩</span><span><i class="dot sn"></i>間食</span>
+          <span><i class="line burn"></i>消費</span><span><i class="line avgburn"></i>平均消費</span>
+          <span><i class="line tgt"></i>目標摂取</span><span><i class="line wt"></i>体重</span>
+        </div>
+        <div id="chart-tip" class="chart-tip">グラフをタッチすると、その日の詳細が表示されます</div>
+        <div class="chart-wrap"><canvas id="chart" height="320"></canvas></div>
+        <div id="chart-note" class="muted"></div>
+        <div class="row wrap mt">
+          <button class="btn sm" data-report="7">📄 週次レポート</button>
+          <button class="btn sm" data-report="30">📄 月次レポート</button>
+        </div>
+      </section>`;
+    $$("[data-report]").forEach((b) => (b.onclick = () => openReport(parseInt(b.dataset.report, 10))));
+    $$(".seg-btn").forEach((b) => (b.onclick = () => { trendPeriod = b.dataset.p; renderTrend(view); }));
+    drawChart();
+    attachChartInteraction();
+  }
+
+  // 選択日の詳細を上部のバーに表示
+  function showTip(idx) {
+    const tip = $("#chart-tip"); if (!tip || !chartGeom) return;
+    if (idx == null) { tip.textContent = "グラフをタッチすると、その日の詳細が表示されます"; return; }
+    const d = chartGeom.data[idx];
+    if (!d) return;
+    const total = d.br + d.lu + d.di + d.sn;
+    const w = d.weight != null ? `${fmt(d.weight, 1)}kg` : "—";
+    const avg = trendPeriod === "day" ? "" : " <small>(平均)</small>";
+    tip.innerHTML = `<b>${d.label}</b> ｜ 摂取 <b>${fmt(total)}</b>kcal `
+      + `<small>(朝${fmt(d.br)}/昼${fmt(d.lu)}/晩${fmt(d.di)}/間${fmt(d.sn)})</small>`
+      + ` ｜ 消費 <b>${fmt(d.burn)}</b>kcal ｜ 体重 ${w}${avg}`;
+  }
+
+  // タッチ/マウスで縦ライン＋詳細表示
+  function attachChartInteraction() {
+    const canvas = $("#chart"); if (!canvas) return;
+    const idxFromX = (clientX) => {
+      if (!chartGeom) return null;
+      const rect = canvas.getBoundingClientRect();
+      const idx = Math.round((clientX - rect.left - chartGeom.padL) / chartGeom.slotW - 0.5);
+      return Math.max(0, Math.min(chartGeom.data.length - 1, idx));
+    };
+    const handle = (clientX) => { const idx = idxFromX(clientX); if (idx == null) return; drawChart(idx); showTip(idx); };
+    // passive のままにして、縦方向のページスクロールは妨げない
+    canvas.addEventListener("touchstart", (e) => handle(e.touches[0].clientX), { passive: true });
+    canvas.addEventListener("touchmove", (e) => handle(e.touches[0].clientX), { passive: true });
+    canvas.addEventListener("mousedown", (e) => handle(e.clientX));
+    canvas.addEventListener("mousemove", (e) => { if (e.buttons) handle(e.clientX); });
+  }
+
+  function buildSeries() {
+    const logs = State.data.logs;
+    const p = State.data.profile;
+    const buckets = [];
+    const now = new Date();
+    const push = (label, keys) => {
+      let br = 0, lu = 0, di = 0, sn = 0, burn = 0, wSum = 0, wN = 0, dN = 0;
+      keys.forEach((k) => {
+        const l = logs[k];
+        if (!l || !dayHasContent(l)) return; // 空の記録は集計しない
+        dN++;
+        const t = dayTotals(l);
+        br += t.slots.breakfast.kcal; lu += t.slots.lunch.kcal;
+        di += t.slots.dinner.kcal; sn += t.slots.snack.kcal;
+        burn += Metrics.burned(p, l.activity).total;
+        if (l.weight != null) { wSum += l.weight; wN++; }
+      });
+      const div = trendPeriod === "day" ? 1 : Math.max(dN, 1);
+      buckets.push({
+        label, br: br / div, lu: lu / div, di: di / div, sn: sn / div,
+        burn: dN ? burn / div : 0, weight: wN ? wSum / wN : null, hasData: dN > 0,
+      });
+    };
+    if (trendPeriod === "day") {
+      for (let i = 13; i >= 0; i--) {
+        const d = new Date(now); d.setDate(d.getDate() - i);
+        push(`${d.getMonth() + 1}/${d.getDate()}`, [d.toISOString().slice(0, 10)]);
+      }
+    } else if (trendPeriod === "week") {
+      for (let i = 7; i >= 0; i--) {
+        const end = new Date(now); end.setDate(end.getDate() - i * 7);
+        const keys = [];
+        for (let j = 0; j < 7; j++) { const d = new Date(end); d.setDate(d.getDate() - j); keys.push(d.toISOString().slice(0, 10)); }
+        push(`${end.getMonth() + 1}/${end.getDate()}週`, keys);
+      }
+    } else if (trendPeriod === "month") {
+      for (let i = 11; i >= 0; i--) {
+        const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+        const keys = [];
+        const dim = new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+        for (let day = 1; day <= dim; day++) keys.push(new Date(d.getFullYear(), d.getMonth(), day).toISOString().slice(0, 10));
+        push(`${d.getFullYear() % 100}/${d.getMonth() + 1}`, keys);
+      }
+    } else {
+      for (let i = 4; i >= 0; i--) {
+        const y = now.getFullYear() - i;
+        const keys = Object.keys(logs).filter((k) => k.startsWith(String(y)));
+        push(`${y}年`, keys);
+      }
+    }
+    return buckets;
+  }
+
+  function drawChart(highlight) {
+    const canvas = $("#chart");
+    if (!canvas) return;
+    const data = buildSeries();
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth || canvas.parentElement.clientWidth;
+    const cssH = 320;
+    canvas.width = cssW * dpr; canvas.height = cssH * dpr;
+    const ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    const padL = 44, padR = 44, padT = 20, padB = 40;
+    const plotW = cssW - padL - padR, plotH = cssH - padT - padB;
+    const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+    const axis = dark ? "#556" : "#c9d2dc", text = dark ? "#9fb0c0" : "#6b7785";
+
+    const maxKcal = Math.max(2000, ...data.map((d) => d.br + d.lu + d.di + d.sn), ...data.map((d) => d.burn)) * 1.1;
+    const weights = data.map((d) => d.weight).filter((w) => w != null);
+    const wMin = weights.length ? Math.min(...weights) - 1 : 0;
+    const wMax = weights.length ? Math.max(...weights) + 1 : 1;
+
+    const n = data.length;
+    const slotW = plotW / n;
+    const barW = Math.min(28, slotW * 0.55);
+    const colors = { br: "#f6c453", lu: "#67b26f", di: "#4a90d9", sn: "#c56cf0" };
+    const y0 = padT + plotH;
+
+    // 選択日のハイライト帯（棒より背面に描く）
+    if (highlight != null && data[highlight]) {
+      const cx = padL + slotW * (highlight + 0.5);
+      ctx.fillStyle = dark ? "rgba(224,86,79,0.16)" : "rgba(224,86,79,0.10)";
+      ctx.fillRect(cx - slotW / 2, padT, slotW, plotH);
+    }
+
+    // グリッド + 左軸(kcal)
+    ctx.strokeStyle = axis; ctx.fillStyle = text; ctx.font = "11px sans-serif"; ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = padT + (plotH / 4) * i;
+      ctx.globalAlpha = 0.3; ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(cssW - padR, y); ctx.stroke(); ctx.globalAlpha = 1;
+      ctx.textAlign = "right"; ctx.fillText(fmt(maxKcal * (1 - i / 4)), padL - 6, y + 3);
+    }
+    // 右軸(体重)
+    if (weights.length) {
+      ctx.textAlign = "left";
+      for (let i = 0; i <= 4; i++) {
+        const y = padT + (plotH / 4) * i;
+        ctx.fillText(fmt(wMax - (wMax - wMin) * (i / 4), 1), cssW - padR + 6, y + 3);
+      }
+    }
+
+    // 積み上げ棒(摂取)
+    data.forEach((d, i) => {
+      const cx = padL + slotW * (i + 0.5);
+      let acc = 0;
+      [["br", d.br], ["lu", d.lu], ["di", d.di], ["sn", d.sn]].forEach(([k, v]) => {
+        const h = (v / maxKcal) * plotH;
+        ctx.fillStyle = colors[k];
+        ctx.fillRect(cx - barW / 2, y0 - acc - h, barW, h);
+        acc += h;
+      });
+    });
+
+    // x軸ラベル（間引いて重ならないように・最後は必ず表示）
+    const step = Math.max(1, Math.ceil(n / 7));
+    ctx.fillStyle = text; ctx.textAlign = "center";
+    data.forEach((d, i) => {
+      if (i % step === 0 || i === n - 1) ctx.fillText(d.label, padL + slotW * (i + 0.5), cssH - padB + 16);
+    });
+
+    // 消費ライン
+    ctx.strokeStyle = "#e0564f"; ctx.lineWidth = 2; ctx.beginPath();
+    data.forEach((d, i) => {
+      const cx = padL + slotW * (i + 0.5);
+      const y = y0 - (d.burn / maxKcal) * plotH;
+      i === 0 ? ctx.moveTo(cx, y) : ctx.lineTo(cx, y);
+    });
+    ctx.stroke();
+    data.forEach((d, i) => {
+      if (!d.burn) return;
+      const cx = padL + slotW * (i + 0.5);
+      const y = y0 - (d.burn / maxKcal) * plotH;
+      ctx.fillStyle = "#e0564f"; ctx.beginPath(); ctx.arc(cx, y, 2.5, 0, 7); ctx.fill();
+    });
+
+    // ボーダー横線（平均消費／目標摂取）。棒がどの線を超えたか一目で分かる
+    const goal = GOALS.find((g) => g.key === (State.data.profile.goal)) || GOALS[1];
+    const burnVals = data.filter((d) => d.hasData && d.burn > 0).map((d) => d.burn);
+    if (burnVals.length) {
+      const avgBurn = burnVals.reduce((a, b) => a + b, 0) / burnVals.length;
+      const avgTarget = avgBurn * (1 + goal.adjust);
+      const hline = (val, color, label, dash, labelRight) => {
+        const y = y0 - (Math.min(val, maxKcal) / maxKcal) * plotH;
+        ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.setLineDash(dash);
+        ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(cssW - padR, y); ctx.stroke(); ctx.setLineDash([]);
+        ctx.fillStyle = color; ctx.font = "10px sans-serif";
+        ctx.textAlign = labelRight ? "right" : "left";
+        ctx.fillText(`${label} ${fmt(val)}`, labelRight ? cssW - padR - 4 : padL + 4, y - 4);
+        ctx.font = "11px sans-serif"; ctx.textAlign = "center";
+      };
+      hline(avgBurn, "#e0564f", "平均消費", [2, 3], true);   // 赤の点線（これを超えると増加方向）
+      hline(avgTarget, "#3a7bd5", "目標", [6, 4], false);    // 青の破線（目標ライン）
+    }
+
+    // 体重ライン(右軸)
+    if (weights.length) {
+      ctx.strokeStyle = "#2bb3a3"; ctx.lineWidth = 2; ctx.setLineDash([5, 3]); ctx.beginPath();
+      let started = false;
+      data.forEach((d, i) => {
+        if (d.weight == null) return;
+        const cx = padL + slotW * (i + 0.5);
+        const y = padT + (1 - (d.weight - wMin) / (wMax - wMin)) * plotH;
+        started ? ctx.lineTo(cx, y) : ctx.moveTo(cx, y); started = true;
+      });
+      ctx.stroke(); ctx.setLineDash([]);
+      data.forEach((d, i) => {
+        if (d.weight == null) return;
+        const cx = padL + slotW * (i + 0.5);
+        const y = padT + (1 - (d.weight - wMin) / (wMax - wMin)) * plotH;
+        ctx.fillStyle = "#2bb3a3"; ctx.beginPath(); ctx.arc(cx, y, 3, 0, 7); ctx.fill();
+      });
+    }
+
+    // 選択日の赤い縦ライン（最前面）＋各値のマーカー
+    if (highlight != null && data[highlight]) {
+      const d = data[highlight];
+      const cx = padL + slotW * (highlight + 0.5);
+      ctx.strokeStyle = "#e0564f"; ctx.lineWidth = 2; ctx.setLineDash([5, 3]);
+      ctx.beginPath(); ctx.moveTo(cx, padT); ctx.lineTo(cx, y0); ctx.stroke(); ctx.setLineDash([]);
+      // 消費マーカー
+      if (d.burn) {
+        const y = y0 - (d.burn / maxKcal) * plotH;
+        ctx.fillStyle = "#e0564f"; ctx.beginPath(); ctx.arc(cx, y, 4, 0, 7); ctx.fill();
+        ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
+      }
+      // 体重マーカー
+      if (d.weight != null && weights.length) {
+        const y = padT + (1 - (d.weight - wMin) / (wMax - wMin)) * plotH;
+        ctx.fillStyle = "#2bb3a3"; ctx.beginPath(); ctx.arc(cx, y, 4, 0, 7); ctx.fill();
+        ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.stroke();
+      }
+    }
+
+    // 交互作用用にジオメトリを保存
+    chartGeom = { data, padL, slotW };
+
+    const proj = weightProjection(30);
+    const filled = data.filter((d) => d.hasData).length;
+    $("#chart-note").innerHTML = (proj
+      ? `このペースだと1ヶ月後は約 <b>${fmt(proj.predicted, 1)}kg</b>（${proj.perMonth >= 0 ? "+" : ""}${fmt(proj.perMonth, 1)}kg/月${proj.capped ? "・上限で丸め" : ""}）。<br>` : "")
+      + (filled
+        ? `左軸=カロリー(kcal) / 右軸=体重(kg)。記録のある期間: ${filled}区間。`
+        : "この期間の記録がありません。「記録する」からデータを追加してください。");
+  }
+
+  // ==========================================================================
+  //  レポート出力（週次・月次／印刷でPDF保存）
+  // ==========================================================================
+  function buildReportData(days) {
+    const p = State.data.profile;
+    const logs = State.data.logs;
+    const rows = [];
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(); d.setDate(d.getDate() - i);
+      const k = dstr(d);
+      const l = logs[k];
+      if (!l || !dayHasContent(l)) continue;
+      const t = dayTotals(l);
+      const b = Metrics.burned(p, l.activity);
+      rows.push({ date: k, t, burn: b.total, target: Metrics.targetIntake(p, b.total), log: l });
+    }
+    if (!rows.length) return null;
+    const avg = (f) => rows.reduce((a, r) => a + f(r), 0) / rows.length;
+    const weights = rows.filter((r) => r.log.weight != null).map((r) => r.log.weight);
+    const dishes = {};
+    rows.forEach((r) => Object.values(r.log.meals || {}).forEach((items) => (items || []).forEach((it) => {
+      dishes[it.name] = (dishes[it.name] || 0) + 1;
+    })));
+    const top = Object.entries(dishes).sort((a, b) => b[1] - a[1]).slice(0, 5);
+    return {
+      days, rows, recorded: rows.length,
+      intake: avg((r) => r.t.all.kcal), burn: avg((r) => r.burn), target: avg((r) => r.target),
+      p: avg((r) => r.t.all.p), f: avg((r) => r.t.all.f), c: avg((r) => r.t.all.c),
+      fiber: avg((r) => r.t.all.fiber), salt: avg((r) => r.t.all.salt),
+      withinTarget: rows.filter((r) => r.t.all.kcal <= r.target).length,
+      weightStart: weights[0] ?? null, weightEnd: weights[weights.length - 1] ?? null,
+      wk: weeklyBody(days), streak: streakDays(), top,
+    };
+  }
+  function reportHtml(r) {
+    const p = State.data.profile;
+    const nt = Metrics.nutrientTargets(p, r.target);
+    const wDiff = (r.weightStart != null && r.weightEnd != null) ? r.weightEnd - r.weightStart : null;
+    const row = (l, v) => `<tr><th>${l}</th><td>${v}</td></tr>`;
+    return `
+      <h2>健康レポート（直近${r.days}日）</h2>
+      <p class="rp-sub">${new Date().toLocaleDateString("ja-JP")} 作成 ／ 記録日数 ${r.recorded}日 ／ 連続記録 ${r.streak}日</p>
+      <h3>カロリー</h3>
+      <table class="rp-tbl">
+        ${row("平均摂取", `${fmt(r.intake)} kcal`)}
+        ${row("平均消費", `${fmt(r.burn)} kcal`)}
+        ${row("平均目標", `${fmt(r.target)} kcal`)}
+        ${row("平均収支", `${r.intake - r.burn >= 0 ? "+" : ""}${fmt(r.intake - r.burn)} kcal`)}
+        ${row("目標内に収まった日", `${r.withinTarget} / ${r.recorded} 日`)}
+      </table>
+      <h3>栄養素（1日平均）</h3>
+      <table class="rp-tbl">
+        ${row("たんぱく質", `${fmt(r.p, 1)} g（目標 ${fmt(nt.protein)} g）`)}
+        ${row("脂質", `${fmt(r.f, 1)} g`)}
+        ${row("炭水化物", `${fmt(r.c, 1)} g`)}
+        ${row("食物繊維", `${fmt(r.fiber, 1)} g（目標 ${fmt(nt.fiber)} g）`)}
+        ${row("食塩相当量", `${fmt(r.salt, 1)} g（上限 ${fmt(nt.saltMax, 1)} g）`)}
+      </table>
+      <h3>からだ</h3>
+      <table class="rp-tbl">
+        ${row("体重", r.weightStart != null ? `${fmt(r.weightStart, 1)} → ${fmt(r.weightEnd, 1)} kg（${wDiff >= 0 ? "+" : ""}${fmt(wDiff, 1)} kg）` : "記録なし")}
+        ${row("BMI", `${fmt(Metrics.bmi(p), 1)}（${Metrics.bmiCategory(Metrics.bmi(p)).label}）`)}
+        ${row("平均睡眠", r.wk.sleepAvg != null ? `${fmt(r.wk.sleepAvg, 1)} 時間` : "記録なし")}
+        ${row("平均水分", r.wk.waterAvg != null ? `${fmt(r.wk.waterAvg)} ml` : "記録なし")}
+        ${row("飲酒", `${r.wk.alcoholDays} 日`)}
+        ${row("コーヒー", `${fmt(r.wk.coffee)} 杯`)}
+      </table>
+      <h3>よく食べたもの</h3>
+      <ol class="rp-list">${r.top.map(([n, c]) => `<li>${escapeHtml(n)} — ${c}回</li>`).join("") || "<li>記録なし</li>"}</ol>
+      <h3>日別の記録</h3>
+      <table class="rp-tbl rp-days">
+        <tr><th>日付</th><th>摂取</th><th>消費</th><th>体重</th></tr>
+        ${r.rows.map((x) => `<tr><td>${x.date}</td><td>${fmt(x.t.all.kcal)}</td><td>${fmt(x.burn)}</td><td>${x.log.weight != null ? fmt(x.log.weight, 1) : "—"}</td></tr>`).join("")}
+      </table>
+      <p class="rp-note">※ 栄養値は概算です。医療上の判断は医師・管理栄養士にご相談ください。</p>`;
+  }
+  function openReport(days) {
+    const r = buildReportData(days);
+    if (!r) { alert("この期間の記録がありません。"); return; }
+    const html = reportHtml(r);
+    let printArea = document.getElementById("report-print");
+    if (!printArea) {
+      printArea = document.createElement("div");
+      printArea.id = "report-print";
+      document.body.appendChild(printArea);
+    }
+    printArea.innerHTML = html;
+    const modal = makeModal(`📄 ${days === 7 ? "週次" : "月次"}レポート`);
+    const body = $(".modal-body", modal);
+    body.innerHTML = `<div class="report-view">${html}</div>
+      <button class="btn primary block" id="rp-print">印刷 / PDFで保存</button>
+      <p class="muted">iPhoneでは「印刷」画面から共有ボタン →「PDFとして保存」でファイルに残せます。</p>`;
+    $("#rp-print", body).onclick = () => window.print();
+  }
+
+  // ==========================================================================
+  //  設定
+  // ==========================================================================
+  // AIサービスの選択肢定義（1つのドロップダウンで3択）
+  const AI_CHOICES = {
+    gemini: {
+      label: "Google Gemini（無料）", provider: "gemini", model: null,
+      ph: "AIza...", link: "https://aistudio.google.com/app/apikey", linkName: "Google AI Studio",
+      note: "無料枠内なら課金なしで使えます（1日あたりの回数制限あり）。まずはこれがおすすめ。",
+    },
+    "claude-opus-4-8": {
+      label: "Claude 高精度（Opus・有料）", provider: "anthropic", model: "claude-opus-4-8",
+      ph: "sk-ant-...", link: "https://console.anthropic.com/settings/keys", linkName: "Anthropic Console",
+      note: "推定精度は高め。料金の目安は写真1枚あたり約¥3〜5（従量課金・残高登録が必要）。",
+    },
+    "claude-haiku-4-5": {
+      label: "Claude 低コスト（Haiku・有料）", provider: "anthropic", model: "claude-haiku-4-5",
+      ph: "sk-ant-...", link: "https://console.anthropic.com/settings/keys", linkName: "Anthropic Console",
+      note: "精度はやや控えめだが安価。料金の目安は写真1枚あたり約¥1弱（従量課金・残高登録が必要）。",
+    },
+  };
+  function currentAiKey(s) {
+    if ((s.provider || "gemini") === "gemini") return "gemini";
+    return s.model || "claude-opus-4-8";
+  }
+  function renderSettings(view) {
+    const s = State.data.settings;
+    const aiKey = currentAiKey(s);
+    const info = AI_CHOICES[aiKey];
+    const keys = s.keys || { gemini: "", anthropic: "" };
+    const has = (p) => (keys[p] ? "✅登録済み" : "未登録");
+    const dayCount = Object.keys(State.data.logs).filter((k) => dayTotals(State.log(k)).all.kcal > 0).length;
+    view.innerHTML = `
+      <section class="card">
+        <h2>設定</h2>
+        <h3>写真AI解析（任意）</h3>
+        <p class="muted">料理写真からカロリー・食材・栄養素を自動推定します。APIキーはこの端末のブラウザ内（localStorage）にのみ保存され、
+          外部へ送られるのは解析時に選んだAIサービスへの通信だけです。</p>
+
+        <label class="block">使うAIサービス（切り替えると対応キーを自動使用）
+          <select id="set-ai">
+            ${Object.entries(AI_CHOICES).map(([k, v]) => `<option value="${k}" ${aiKey === k ? "selected" : ""}>${v.label}</option>`).join("")}
+          </select>
+        </label>
+        <p class="muted">現在: <b>${info.label}</b> — ${info.note}</p>
+
+        <h4 class="mt">APIキー（両方まとめて登録しておけます）</h4>
+        <label class="block">Google Gemini のキー <span class="badge ${keys.gemini ? "good" : "warn"} sm">${has("gemini")}</span>
+          <input type="password" id="key-gemini" value="${keys.gemini || ""}" placeholder="AIza...">
+        </label>
+        <p class="muted"><a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">Google AI Studio</a> で無料取得</p>
+        <label class="block">Anthropic Claude のキー <span class="badge ${keys.anthropic ? "good" : "warn"} sm">${has("anthropic")}</span>
+          <input type="password" id="key-anthropic" value="${keys.anthropic || ""}" placeholder="sk-ant-...">
+        </label>
+        <p class="muted"><a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">Anthropic Console</a> で取得（高精度Opus / 低コストHaiku 共通）</p>
+
+        <button class="btn primary" id="set-save">保存する</button>
+        <p class="muted">未設定でも手動記録・分析・グラフはすべて利用できます。</p>
+      </section>
+
+      <section class="card">
+        <h3>☁️ クラウド同期（iPhone / iPad で共有）</h3>
+        <p class="muted">状態: <b id="sync-status">${syncStatusText()}</b>
+          ${Sync.cfg.gistId ? `<br>同期ID: <code>${Sync.cfg.gistId}</code>` : ""}</p>
+        <label class="block">GitHubトークン（gistのみの権限）
+          <input type="password" id="sy-token" value="${Sync.cfg.token || ""}" placeholder="ghp_...">
+        </label>
+        <label class="block">同期ID（2台目以降は1台目のIDを貼り付け）
+          <input type="text" id="sy-gist" value="${Sync.cfg.gistId || ""}" placeholder="初回は空のままでOK">
+        </label>
+        <div class="row wrap">
+          <button class="btn sm primary" id="sy-now">今すぐ同期</button>
+          ${Sync.cfg.gistId ? `<button class="btn sm" id="sy-copy">同期IDをコピー</button>` : ""}
+          ${Sync.enabled() ? `<button class="btn sm danger" id="sy-off">同期を解除</button>` : ""}
+        </div>
+        <div id="sy-msg"></div>
+        <p class="muted"><b>設定手順</b>：①
+          <a href="https://github.com/settings/tokens/new?scopes=gist&description=meal-health-sync" target="_blank" rel="noopener">このリンク</a>
+          でトークンを作成（権限は <b>gist</b> のみ、有効期限はNo expirationが便利）→ ② 上の欄に貼って「今すぐ同期」→
+          ③ 表示された<b>同期ID</b>をもう一方の端末の同じ欄に入力して「今すぐ同期」。<br>
+          以降は<b>アプリを開いたときと記録の数秒後に自動同期</b>されます。データは<b>非公開のGist</b>に保存され、
+          トークンはこの端末にのみ保存されます（同期対象外）。</p>
+        <p class="warn-box">🔒 <b>プライバシー</b>: 同期は「同じトークン＋同じ同期ID」を入れた端末どうしでのみ共有されます。
+          自分のiPhoneとiPadを繋ぐ用途で使い、<b>家族には教えないでください</b>。
+          家族が同期を使う場合は、各自のGitHubアカウントで別のトークンを作れば、お互いのデータは見えません。</p>
+      </section>
+
+      <section class="card">
+        <h3>👨‍👩‍👧 家族と使う</h3>
+        <p class="muted">このアプリは <b>1台につき1人分</b> のデータだけを扱います。
+          家族はそれぞれの端末で、それぞれのGitHubトークンを使ってください。
+          <b>お互いのデータは見えません。</b></p>
+        <label class="block">この端末の利用者名（表示用）
+          <input type="text" id="set-uname" value="${escapeHtml(State.currentName())}" placeholder="例: 自分">
+        </label>
+        <div class="row wrap">
+          <button class="btn sm" id="set-uname-save">名前を保存</button>
+          <button class="btn sm" id="set-share">アプリのURLをコピー</button>
+        </div>
+        <p class="urlbox">${location.origin}${location.pathname}</p>
+        <p class="muted">家族に渡す手順: 上のURLを送る → 各自のブラウザで開く → 各自でプロフィールを入力。
+          同期を使うなら、<b>各自のGitHubアカウントでトークンを作成</b>してください
+          （同じトークンを共有すると相手のデータも見えてしまいます）。</p>
+        ${State.users().length > 1 ? `
+          <p class="warn-box">⚠️ この端末には他に ${State.users().length - 1} 人分のデータが残っています。
+            プライバシーのため、不要なら削除してください（同期先にも含まれています）。</p>
+          <button class="btn sm danger" id="set-purge">他の人のデータを削除</button>` : ""}
+      </section>
+
+      <section class="card">
+        <h3>🍳 朝食のスタイル</h3>
+        <p class="muted">レシピ提案でカロリーを配分するときの目安です。記録が3件以上たまると、
+          <b>平日／週末それぞれの実際の食べ方</b>を自動学習してこの設定より優先されます。</p>
+        <label class="block">通常の朝食
+          <select id="set-bf">
+            <option value="auto" ${(s.breakfastStyle || "auto") === "auto" ? "selected" : ""}>おまかせ（記録から自動学習）</option>
+            <option value="light" ${s.breakfastStyle === "light" ? "selected" : ""}>軽め（プロテインのみ等・約200kcal）</option>
+            <option value="solid" ${s.breakfastStyle === "solid" ? "selected" : ""}>しっかり（約500kcal）</option>
+          </select>
+        </label>
+      </section>
+
+      <section class="card">
+        <h3>🔔 記録のリマインダー</h3>
+        <label class="row" style="flex-direction:row;align-items:center;gap:8px">
+          <input type="checkbox" id="set-nudge" ${s.nudge === false ? "" : "checked"} style="width:auto">
+          <span>アプリ内で未記録の食事をお知らせする（朝10時／昼14時／夜21時以降）</span>
+        </label>
+        <p class="muted">iOSではWebアプリからのプッシュ通知が制限されるため、<b>時刻通知は「ショートカット」アプリの
+          オートメーション</b>で設定するのが確実です。手順: ショートカット →「オートメーション」→ ＋ →「時刻」→
+          時刻を指定 →「通知を表示」（例: 記録してね）＋「URLを開く」で
+          <code>${location.origin}${location.pathname}</code> を指定。</p>
+      </section>
+
+      <section class="card">
+        <h3>📲 iPhoneヘルスケアの歩数を取り込む</h3>
+        <p class="muted">SafariはiPhoneのヘルスケアを直接読めないため、「ショートカット」アプリで橋渡しします。
+          下のURLを歩数付きで開くと、その日の歩数を自動記録します（末尾の数字が歩数）。</p>
+        <p class="urlbox" id="hk-url">${location.origin}${location.pathname}?steps=8000</p>
+        <button class="btn sm" id="hk-copy">連携用URLの雛形をコピー</button>
+        <p class="muted">ショートカットの作り方: ①「ヘルスケアサンプルを検索」で歩数・当日・合計を取得 →
+          ②「URLを開く」で <code>${location.origin}${location.pathname}?steps=</code> の後ろに①の結果を付ける。
+          自動化(オートメーション)で毎晩実行すれば、開くだけで歩数が入ります。</p>
+      </section>
+
+      <section class="card">
+        <h3>データ管理</h3>
+        <p class="muted">記録済みの日数: <b>${dayCount}日</b></p>
+        <div class="row wrap">
+          <button class="btn" id="set-export">JSONで書き出し</button>
+          <label class="btn">JSONを読み込み<input type="file" id="set-import" accept="application/json" hidden></label>
+          <button class="btn" id="set-clean">空の記録を掃除</button>
+          <button class="btn danger" id="set-reset">全データを消去</button>
+        </div>
+        <p class="muted">「空の記録を掃除」は、食事・歩数・運動・体重のいずれも入っていない日（日付操作で自動生成された空データ）をまとめて削除します。</p>
+      </section>`;
+    const applyChoice = (k) => {
+      const c = AI_CHOICES[k];
+      State.data.settings.provider = c.provider;
+      State.data.settings.model = c.model;
+    };
+    const saveKeys = () => {
+      State.data.settings.keys = {
+        gemini: $("#key-gemini").value.trim(),
+        anthropic: $("#key-anthropic").value.trim(),
+      };
+    };
+    $("#set-ai").onchange = (e) => {
+      saveKeys();                 // 入力中のキーを失わない
+      applyChoice(e.target.value); // 対応キーへ自動で切り替え
+      State.save(); renderSettings(view);
+    };
+    $("#set-save").onclick = () => {
+      applyChoice($("#set-ai").value);
+      saveKeys();
+      State.save(); alert("保存しました。選択中のサービスとキーで解析します。");
+    };
+    $("#set-nudge").onchange = (e) => { State.data.settings.nudge = e.target.checked; State.save(); };
+    $("#set-bf").onchange = (e) => { State.data.settings.breakfastStyle = e.target.value; State.save(); };
+    $("#sy-now").onclick = async () => {
+      const msg = $("#sy-msg");
+      Sync.cfg.token = $("#sy-token").value.trim();
+      Sync.cfg.gistId = $("#sy-gist").value.trim() || Sync.cfg.gistId;
+      if (!Sync.cfg.token) { msg.innerHTML = `<p class="warn-box">GitHubトークンを入力してください。</p>`; return; }
+      Sync.saveCfg();
+      msg.innerHTML = `<p class="loading">☁️ 同期中…</p>`;
+      try {
+        await Sync.sync();
+        msg.innerHTML = `<p class="good-box">✅ 同期しました。他の端末では同期IDに
+          <code>${Sync.cfg.gistId}</code> を入力してください。</p>`;
+        renderSettings(view);
+      } catch (e) { msg.innerHTML = `<p class="warn-box">${e.message}</p>`; }
+    };
+    const syCopy = $("#sy-copy");
+    if (syCopy) syCopy.onclick = () => {
+      const done = () => alert(`同期IDをコピーしました:\n${Sync.cfg.gistId}`);
+      if (navigator.clipboard) navigator.clipboard.writeText(Sync.cfg.gistId).then(done, done); else done();
+    };
+    const syOff = $("#sy-off");
+    if (syOff) syOff.onclick = () => {
+      if (!confirm("同期を解除します。この端末のデータは残ります。")) return;
+      Sync.cfg = {}; Sync.saveCfg(); renderSettings(view);
+    };
+    $("#set-uname-save").onclick = () => {
+      const n = $("#set-uname").value.trim();
+      if (!n) return;
+      State.renameUser(State.data.currentUser, n); alert("保存しました。"); renderSettings(view);
+    };
+    const purge = $("#set-purge");
+    if (purge) purge.onclick = () => {
+      const others = Object.keys(State.data.users).filter((id) => id !== State.data.currentUser);
+      if (!confirm(`この端末に残っている他 ${others.length} 人分のデータを削除します。よろしいですか？`)) return;
+      others.forEach((id) => delete State.data.users[id]);
+      // 削除済みとして記録し、次回以降の同期で復活しないようにする
+      State.data.deletedUsers = (State.data.deletedUsers || []).concat(others);
+      State.save(true);
+      // 同期中なら、取得せずに上書き送信してクラウド側からも消す
+      if (Sync.enabled()) {
+        Sync.push().then(() => { alert("削除し、クラウドにも反映しました。"); renderSettings(view); })
+          .catch((e) => { alert(`端末からは削除しましたが、クラウド反映に失敗しました: ${e.message}`); renderSettings(view); });
+      } else { alert("削除しました。"); renderSettings(view); }
+    };
+    $("#set-share").onclick = () => {
+      const url = `${location.origin}${location.pathname}`;
+      const done = () => alert(`コピーしました:\n${url}\n\n家族に送って、各自のブラウザで開いてもらってください。`);
+      if (navigator.clipboard) navigator.clipboard.writeText(url).then(done, done); else done();
+    };
+    $("#hk-copy").onclick = () => {
+      const url = `${location.origin}${location.pathname}?steps=`;
+      const done = () => alert(`コピーしました:\n${url}[歩数]\n\n末尾に歩数を付けて開くと記録されます。`);
+      if (navigator.clipboard) navigator.clipboard.writeText(url).then(done, done); else done();
+    };
+    $("#set-export").onclick = () => {
+      const blob = new Blob([JSON.stringify(State.data, null, 2)], { type: "application/json" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `meal-health-${todayStr()}.json`; a.click();
+    };
+    $("#set-import").onchange = (e) => {
+      const f = e.target.files[0]; if (!f) return;
+      const r = new FileReader();
+      r.onload = () => {
+        try { State.data = JSON.parse(r.result); State.save(); alert("読み込みました。"); render(); }
+        catch (_) { alert("読み込みに失敗しました。"); }
+      };
+      r.readAsText(f);
+    };
+    $("#set-clean").onclick = () => {
+      const empties = Object.keys(State.data.logs).filter((k) => !dayHasContent(State.data.logs[k]));
+      if (!empties.length) { alert("空の記録はありませんでした。"); return; }
+      if (confirm(`空の記録 ${empties.length}日分（例: ${empties.slice(0, 3).join(", ")}${empties.length > 3 ? " …" : ""}）を削除します。よろしいですか？`)) {
+        empties.forEach((k) => delete State.data.logs[k]);
+        State.save(); alert(`${empties.length}日分の空データを削除しました。`); renderSettings(view);
+      }
+    };
+    $("#set-reset").onclick = () => {
+      if (confirm("すべての記録を消去します。よろしいですか？")) {
+        localStorage.removeItem(STORE_KEY); State.load(); render();
+      }
+    };
+  }
+
+  // ---- モーダル生成 -------------------------------------------------------
+  function makeModal(title) {
+    const el = document.createElement("div");
+    el.className = "modal-bg";
+    el.innerHTML = `<div class="modal"><div class="modal-head"><h3>${title}</h3><button class="modal-x">×</button></div><div class="modal-body"></div></div>`;
+    el.onclick = (e) => { if (e.target === el || e.target.classList.contains("modal-x")) el.remove(); };
+    document.body.appendChild(el);
+    return el;
+  }
+
+  // ---- URLパラメータからの歩数取り込み（iPhoneショートカット連携） --------
+  // 例: .../meal/?steps=8000&date=2026-07-24  で開くと、その日の歩数を自動記録
+  // 各種の日付表記を YYYY-MM-DD に正規化（ショートカットの形式差を吸収）
+  function normalizeDate(s) {
+    if (!s) return null;
+    s = String(s).trim();
+    // 2026-07-20 / 2026/07/20 / 2026.07.20 / 2026年7月20日 / 2026-7-20 / 先頭に日付を含む日時
+    let m = s.match(/(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})/);
+    if (m) return `${m[1]}-${String(m[2]).padStart(2, "0")}-${String(m[3]).padStart(2, "0")}`;
+    const d = new Date(s); // 最後の手段（ローカル日付で解釈し時差ズレを防ぐ）
+    if (!isNaN(d.getTime())) return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    return null;
+  }
+  function importFromURL() {
+    const q = new URLSearchParams(location.search);
+    const steps = parseInt(q.get("steps"), 10);
+    if (!(steps >= 0)) return null;
+    const date = normalizeDate(q.get("date")) || todayStr();
+    const l = State.log(date);
+    l.activity.steps = steps;
+    // 体重も一緒に渡された場合は記録（任意）
+    const w = parseFloat(q.get("weight"));
+    if (w > 0) { l.weight = w; if (date === todayStr() && State.data.profile) State.data.profile.weight = w; }
+    State.save();
+    // クエリを消してリロード時の二重取り込みを防ぐ
+    if (history.replaceState) history.replaceState(null, "", location.pathname + location.hash);
+    return { steps, date, weight: w > 0 ? w : null };
+  }
+
+  // ---- 起動 ---------------------------------------------------------------
+  Sync.load();
+  State.load();
+  const imported = importFromURL();
+  if (imported) { dashDate = imported.date; Nav.current = "dashboard"; }
+  render();
+  if (imported) {
+    setTimeout(() => alert(
+      `ヘルスケアの歩数 ${imported.steps.toLocaleString("ja-JP")}歩 を ${imported.date} に記録しました。` +
+      (imported.weight ? `\n体重 ${imported.weight}kg も記録しました。` : "")), 100);
+  }
+  window.addEventListener("resize", () => { if (Nav.current === "trend") drawChart(); });
+
+  // 起動時に一度だけクラウドと同期（取得→マージ→送信）
+  if (Sync.enabled()) {
+    Sync.sync().then((ok) => { if (ok) { render(); updateSyncBadge(); } })
+      .catch(() => updateSyncBadge("エラー"));
+  }
+})();
