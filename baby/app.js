@@ -248,15 +248,26 @@
     return { label: "太りすぎ", tone: "bad" };
   }
   // 身体計測の記録を日付順に返す
+  /* 出生時の記録（プロフィールに入力があれば月齢0の点として扱う） */
+  function birthPoint() {
+    const p = State.data.profile;
+    if (!p || !p.birth) return null;
+    const w = num(p.birthWeightG) > 0 ? num(p.birthWeightG) / 1000 : null;
+    const h = num(p.birthHeight) > 0 ? num(p.birthHeight) : null;
+    if (!w && !h) return null;
+    return { date: p.birth, months: 0, height: h, weight: w, isBirth: true };
+  }
   function bodySeries() {
     const p = State.data.profile;
-    return Object.keys(State.data.logs).sort()
+    const rows = Object.keys(State.data.logs).sort()
       .map((d) => ({ date: d, b: State.data.logs[d].body || {} }))
       .filter((x) => x.b.height || x.b.weight)
       .map((x) => ({
         date: x.date, months: monthsOld(p && p.birth, x.date),
         height: x.b.height || null, weight: x.b.weight || null,
       }));
+    const bp = birthPoint();
+    return bp ? [bp].concat(rows) : rows;
   }
   function latestBody() {
     const s = bodySeries();
@@ -1097,7 +1108,8 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
             <div class="kpi-v">${months}<small>ヶ月</small></div>
             <div class="kpi-s">${esc(b.date || "")}時点</div></div>
         </div>
-        ${percentileNote(wp, hp)}`}
+        ${percentileNote(wp, hp)}
+        ${birthComparison(wp, hp, b)}`}
       </section>
 
       ${series.length ? `
@@ -1127,7 +1139,7 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
             <tbody>
               ${series.slice().reverse().map((r) => {
                 const kk = kaup(r.weight, r.height);
-                return `<tr><td>${esc(r.date)}</td><td>${r.months}ヶ月</td>
+                return `<tr><td>${esc(r.date)}${r.isBirth ? ' <span class="badge sm brand">出生時</span>' : ""}</td><td>${r.months}ヶ月</td>
                   <td class="num">${r.height ? fmt(r.height, 1) : "—"}</td>
                   <td class="num">${r.weight ? fmt(r.weight, 2) : "—"}</td>
                   <td class="num">${kk ? fmt(kk, 1) : "—"}</td></tr>`;
@@ -1142,6 +1154,61 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
 
     $$("[data-k]").forEach((b2) => (b2.onclick = () => { growthKind = b2.dataset.k; render(); }));
     if (series.length) drawGrowth();
+  }
+
+  /* 出生時と現在を比べる。「もともとの体格」と「途中からの変化」を区別するのが目的。
+     この年齢では、帯から外れていること自体より、生まれた時からの位置の変化が重要になる。 */
+  function birthComparison(wp, hp, cur) {
+    const p = State.data.profile;
+    const bp = birthPoint();
+    if (!bp) {
+      return `<div class="info-box">「プロフィール」に<b>出生時の体重・身長</b>を入れると、
+        生まれた時からの成長曲線が描かれ、もともとの体格か途中からの変化かを見分けられます。</div>`;
+    }
+    const rows = [];
+    let bwp = null, bhp = null;
+    if (bp.weight) {
+      bwp = percentileOf(p.sex, "weight", 0, bp.weight);
+      rows.push(`出生時の体重 ${fmt(p.birthWeightG)}g は約${fmt(bwp)}パーセンタイルでした。`);
+    }
+    if (bp.height) {
+      bhp = percentileOf(p.sex, "height", 0, bp.height);
+      rows.push(`出生時の身長 ${fmt(bp.height, 1)}cm は約${fmt(bhp)}パーセンタイルでした。`);
+    }
+    if (bp.weight && cur.weight) {
+      rows.push(`体重は ${fmt(bp.weight, 2)}kg → ${fmt(cur.weight, 2)}kg で <b>${fmt(cur.weight / bp.weight, 2)}倍</b>です（1歳で約3倍が一般的な目安）。`);
+    }
+
+    // 出生時と現在のパーセンタイル位置を比べて解釈を出す
+    let verdict = "";
+    if (bwp != null && wp != null) {
+      const shift = wp - bwp;
+      if (bwp >= 85 && wp >= 85) {
+        verdict = `体重は<b>出生時から一貫して大きめ</b>です。途中から急に外れたのではなく、もともとの体格に沿った推移と考えられます。`;
+      } else if (bwp <= 15 && wp <= 15) {
+        verdict = `体重は<b>出生時から小さめ</b>です。急な変化ではなく、もともとの体格に沿った推移と考えられます。`;
+      } else if (shift >= 30) {
+        verdict = `体重の位置が出生時の約${fmt(bwp)}→現在約${fmt(wp)}パーセンタイルへ<b>上に移動</b>しています。増え方のペースを次の健診で相談してみてください。`;
+      } else if (shift <= -30) {
+        verdict = `体重の位置が出生時の約${fmt(bwp)}→現在約${fmt(wp)}パーセンタイルへ<b>下に移動</b>しています。次の健診で相談してみてください。`;
+      } else {
+        verdict = `体重の位置は出生時（約${fmt(bwp)}）から現在（約${fmt(wp)}パーセンタイル）まで、大きく変わっていません。`;
+      }
+    }
+    // 体重と身長の位置が離れている場合は、それ自体が読みどころになる
+    let shape = "";
+    if (wp != null && hp != null && wp - hp >= 25) {
+      shape = `身長は約${fmt(hp)}パーセンタイルなので、<b>身長に対して体重が重め</b>という形です。
+        1〜2歳は減量ではなく「増加のペースが緩やかになって身長が追いつくのを待つ」のが基本で、
+        自己判断のカロリー制限は避けてください。健診では体重の絶対値ではなく
+        <b>肥満度（身長別標準体重との比）</b>で評価されます。`;
+    } else if (wp != null && hp != null && hp - wp >= 25) {
+      shape = `体重は約${fmt(wp)}パーセンタイルなので、<b>身長に対して体重が軽め</b>という形です。
+        食事量と機嫌・活動量に問題がなければ様子見のことも多いですが、健診で確認すると安心です。`;
+    }
+
+    return `<div class="info-box"><b>出生時からの変化</b><br>${rows.join("<br>")}
+      ${verdict ? `<br>${verdict}` : ""}${shape ? `<br>${shape}` : ""}</div>`;
   }
 
   function percentileNote(wp, hp) {
@@ -1471,6 +1538,16 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
             <option value="male" ${p.sex === "male" ? "selected" : ""}>男の子</option>
           </select></label>
         </div>
+        <h3 style="margin-top:14px">出生時の記録（任意）</h3>
+        <p class="muted">入れておくと成長曲線が生まれた時から描かれ、
+          「もともと大きめ／小さめだったのか」「途中から変化したのか」が区別できます。
+          健診で見てもらうときに効く情報です。</p>
+        <div class="form-grid">
+          <label>出生時の体重(g)<input type="number" id="p-bw" min="300" max="6000" step="1"
+            value="${p.birthWeightG || ""}" placeholder="例: 3690"></label>
+          <label>出生時の身長(cm)<input type="number" id="p-bh" min="20" max="60" step="0.1"
+            value="${p.birthHeight || ""}" placeholder="例: 49.5"></label>
+        </div>
         <button class="btn primary block" id="p-save">保存する</button>
       </section>
 
@@ -1500,7 +1577,12 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
       const name = $("#p-name").value.trim(), birth = $("#p-birth").value, sex = $("#p-sex").value;
       if (!name || !birth) { alert("お名前と生年月日を入れてください。"); return; }
       if (birth > todayStr()) { alert("生年月日が未来になっています。"); return; }
-      State.data.profile = { name, birth, sex };
+      const bw = num($("#p-bw").value), bh = num($("#p-bh").value);
+      State.data.profile = {
+        name, birth, sex,
+        birthWeightG: bw > 0 ? bw : null,
+        birthHeight: bh > 0 ? bh : null,
+      };
       State.save();
       Nav.go("home");
     };
