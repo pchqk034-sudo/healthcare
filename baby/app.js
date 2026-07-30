@@ -483,6 +483,8 @@
 
   let viewDate = todayStr();     // 記録・ホームで見ている日付
   let growthKind = "weight";     // 成長グラフの表示種別
+  let gSel = null;               // 成長グラフで選択中の記録
+  let gGeom = null;              // 成長グラフのタッチ判定用ジオメトリ
   let planDays = 3;              // 献立の生成日数
 
   function render() {
@@ -1127,6 +1129,7 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
           <span><i class="line band"></i>3% / 97%</span>
         </div>
         <div class="chart-wrap"><canvas id="gchart" height="260"></canvas></div>
+        <div id="gchart-tip" class="chart-tip"></div>
         <p class="muted">帯（3〜97パーセンタイル）の中に入っていて、曲線と同じ向きに伸びているかを見ます。
           一時的に帯から出ることより、<b>カーブから急に外れる変化</b>のほうが大事な情報です。</p>
       </section>
@@ -1152,8 +1155,66 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
       <p class="disclaimer">※ ${esc(GROWTH.note)}
         カウプ指数の判定帯も一般的な目安であり、体格の個人差は大きいものです。</p>`;
 
-    $$("[data-k]").forEach((b2) => (b2.onclick = () => { growthKind = b2.dataset.k; render(); }));
-    if (series.length) drawGrowth();
+    $$("[data-k]").forEach((b2) => (b2.onclick = () => { growthKind = b2.dataset.k; gSel = null; render(); }));
+    if (series.length) {
+      if (gSel != null && gSel >= series.filter((r) => r[growthKind]).length) gSel = null;
+      drawGrowth(gSel);
+      showGrowthTip(gSel);
+      attachGrowthInteraction();
+    }
+  }
+
+  /* 選択した記録の内容を、グラフ下のバーに表示する */
+  function showGrowthTip(idx) {
+    const tip = $("#gchart-tip");
+    if (!tip) return;
+    if (idx == null || !gGeom || !gGeom.series[idx]) {
+      tip.innerHTML = `<small>グラフをタッチすると、その時点の値と月齢ごとの中央値が表示されます。</small>`;
+      return;
+    }
+    const p = State.data.profile;
+    const r = gGeom.series[idx];
+    const v = r[growthKind];
+    const unit = growthKind === "weight" ? "kg" : "cm";
+    const d = growthKind === "weight" ? 2 : 1;
+    const [p3, p50, p97] = refAt(p.sex, growthKind, r.months);
+    const pc = percentileOf(p.sex, growthKind, r.months, v);
+    const k = kaup(r.weight, r.height);
+    tip.innerHTML = `<b>${esc(r.date)}</b>（${r.months}ヶ月${r.isBirth ? "・出生時" : ""}）`
+      + ` ｜ ${growthKind === "weight" ? "体重" : "身長"} <b>${fmt(v, d)}</b>${unit}`
+      + ` <small>(約${fmt(pc)}パーセンタイル)</small>`
+      + (k ? ` ｜ カウプ <b>${fmt(k, 1)}</b>` : "")
+      + `<br><small>この月齢の目安 — 中央値 ${fmt(p50, d)}${unit} / 3%値 ${fmt(p3, d)}${unit} / 97%値 ${fmt(p97, d)}${unit}`
+      + `（中央値との差 ${v - p50 >= 0 ? "+" : ""}${fmt(v - p50, d)}${unit}）</small>`;
+  }
+
+  /* タッチ/マウスで、最も近い記録点を選んで赤い縦ラインを出す */
+  function attachGrowthInteraction() {
+    const canvas = $("#gchart");
+    if (!canvas) return;
+    const idxFromX = (clientX) => {
+      if (!gGeom || !gGeom.series.length) return null;
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left;
+      // X座標を月齢に戻し、記録のある点のうち最も近いものを選ぶ
+      const m = ((x - gGeom.padL) / gGeom.plotW) * gGeom.maxM;
+      let best = 0, bestD = Infinity;
+      gGeom.series.forEach((r, i) => {
+        const dd = Math.abs(r.months - m);
+        if (dd < bestD) { bestD = dd; best = i; }
+      });
+      return best;
+    };
+    const handle = (clientX) => {
+      const idx = idxFromX(clientX);
+      if (idx == null) return;
+      gSel = idx; drawGrowth(idx); showGrowthTip(idx);
+    };
+    // passive のままにして、縦方向のページスクロールは妨げない
+    canvas.addEventListener("touchstart", (e) => handle(e.touches[0].clientX), { passive: true });
+    canvas.addEventListener("touchmove", (e) => handle(e.touches[0].clientX), { passive: true });
+    canvas.addEventListener("mousedown", (e) => handle(e.clientX));
+    canvas.addEventListener("mousemove", (e) => { if (e.buttons) handle(e.clientX); });
   }
 
   /* 出生時と現在を比べる。「もともとの体格」と「途中からの変化」を区別するのが目的。
@@ -1224,7 +1285,7 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
   }
 
   /* 成長曲線を描く（依存なしのCanvas描画） */
-  function drawGrowth() {
+  function drawGrowth(sel) {
     const cv = $("#gchart");
     if (!cv) return;
     const p = State.data.profile;
@@ -1288,7 +1349,21 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
       g.fillStyle = "#f2836b";
       series.forEach((r) => { g.beginPath(); g.arc(X(r.months), Y(r[growthKind]), 3.5, 0, Math.PI * 2); g.fill(); });
     }
+
+    // 選択した記録の赤い縦ライン（最前面）＋その点のマーカー
+    if (sel != null && series[sel]) {
+      const r = series[sel];
+      const cx = X(r.months), cy = Y(r[growthKind]);
+      g.strokeStyle = "#e0564f"; g.lineWidth = 2; g.setLineDash([5, 3]);
+      g.beginPath(); g.moveTo(cx, pad.t); g.lineTo(cx, H - pad.b); g.stroke(); g.setLineDash([]);
+      g.fillStyle = "#e0564f";
+      g.beginPath(); g.arc(cx, cy, 5, 0, Math.PI * 2); g.fill();
+      g.strokeStyle = "#fff"; g.lineWidth = 2; g.stroke();
+    }
     g.fillStyle = inkC;
+
+    // タッチ判定に使うジオメトリを保存
+    gGeom = { series, padL: pad.l, plotW: W - pad.l - pad.r, maxM };
   }
 
   // ==========================================================================
@@ -1733,5 +1808,7 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
   // ==========================================================================
   State.load();
   render();
-  window.addEventListener("resize", () => { if (Nav.current === "growth") drawGrowth(); });
+  window.addEventListener("resize", () => {
+    if (Nav.current === "growth") { drawGrowth(gSel); showGrowthTip(gSel); }
+  });
 })();
