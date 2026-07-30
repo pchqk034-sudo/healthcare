@@ -199,6 +199,18 @@
     .ph-macros { font-size:12px; color:var(--muted); margin:4px 0; }
     .loading { color:var(--info); }
 
+    /* AI相談 */
+    .chat-log { max-height:52vh; overflow-y:auto; display:flex; flex-direction:column; gap:8px;
+      margin-top:12px; padding:10px; background:var(--bg); border:1px solid var(--line); border-radius:12px; }
+    .msg { padding:9px 12px; border-radius:12px; font-size:14px; max-width:88%; line-height:1.6; }
+    .msg.user { align-self:flex-end; background:var(--brand); color:#fff; border-bottom-right-radius:4px; }
+    .msg.assistant { align-self:flex-start; background:var(--card); border:1px solid var(--line); border-bottom-left-radius:4px; }
+    #ch-input { flex:1; }
+
+    /* 同期状態 */
+    .syncchip { font-size:11px; color:var(--muted); }
+    .syncchip.bad { color:var(--bad); font-weight:600; }
+
     .disclaimer { font-size:11.5px; color:var(--muted); line-height:1.6; }
     code { background:var(--bg); border:1px solid var(--line); border-radius:5px; padding:1px 5px; font-size:12px; word-break:break-all; }
     .urlbox { background:var(--bg); border:1px solid var(--line); border-radius:8px; padding:10px 12px;
@@ -207,7 +219,7 @@
 </head>
 <body>
   <div id="app"></div>
-  <script src="data.js?v=4"></script>
-  <script src="app.js?v=4"></script>
+  <script src="data.js?v=5"></script>
+  <script src="app.js?v=5"></script>
 </body>
 </html>

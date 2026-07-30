@@ -18,6 +18,8 @@
   } = window.BABY_DATA;
 
   const STORE_KEY = "babyApp.v1";
+  const SYNC_KEY = "babyApp.sync.v1";
+  const SYNC_FILE = "baby-healthcare.json";
   const MEAL_SLOTS = [
     { key: "breakfast", label: "朝食", icon: "🌅" },
     { key: "lunch", label: "昼食", icon: "🌞" },
@@ -63,7 +65,10 @@
         stock: [],              // 食材在庫
         firstFoods: {},         // 食材名 → { date, status, symptom }
         customFoods: [],        // 写真AI解析などで登録した独自の食品
+        chat: [],               // AI相談の履歴
         plan: null,             // 直近に生成した献立
+        deletedStock: [],       // 在庫削除の墓標（同期で復活させないため）
+        updatedAt: 0,
         settings: { snackPerDay: 1, provider: "gemini", model: null, keys: { gemini: "", anthropic: "" } },
       };
     },
@@ -75,19 +80,109 @@
       if (!Array.isArray(this.data.stock)) this.data.stock = [];
       if (!this.data.firstFoods) this.data.firstFoods = {};
       if (!Array.isArray(this.data.customFoods)) this.data.customFoods = [];
+      if (!Array.isArray(this.data.chat)) this.data.chat = [];
+      if (!Array.isArray(this.data.deletedStock)) this.data.deletedStock = [];
       if (!this.data.settings) this.data.settings = {};
       const s = this.data.settings;
       if (s.snackPerDay == null) s.snackPerDay = 1;
       if (!s.provider) s.provider = "gemini";
       if (!s.keys) s.keys = { gemini: "", anthropic: "" };
       rebuildFoodIndex();
+      this.snapshot();
     },
-    save() {
+    // 変更検出用に、保存時点の各日の記録を控えておく
+    snapshot() {
+      this._snap = {};
+      Object.entries(this.data.logs).forEach(([d, l]) => (this._snap[d] = logSig(l)));
+    },
+    save(skipSync) {
       Object.keys(this.data.logs).forEach((k) => {
         if (!dayHasContent(this.data.logs[k])) delete this.data.logs[k];
       });
+      // 中身が変わった日だけ更新時刻を打つ（同期のマージで日ごとに新しい方を選ぶため）
+      const now = Date.now();
+      Object.entries(this.data.logs).forEach(([d, l]) => {
+        const sig = logSig(l);
+        if (!this._snap || this._snap[d] !== sig) l._at = now;
+      });
+      this.data.updatedAt = now;
       localStorage.setItem(STORE_KEY, JSON.stringify(this.data));
       rebuildFoodIndex();
+      this.snapshot();
+      if (!skipSync) Sync.schedulePush();
+    },
+    // 同期する形（APIキーは端末内に留め、Gistには載せない）
+    persistable() {
+      const { settings, ...rest } = this.data;
+      const { keys, ...safeSettings } = settings || {};
+      return Object.assign({}, rest, { settings: safeSettings });
+    },
+    /* クラウドの内容を取り込む。日ごと・項目ごとにマージする */
+    mergeRemote(R) {
+      if (!R || typeof R !== "object") return false;
+      const L = this.data;
+      const lAt = L.updatedAt || 0, rAt = R.updatedAt || 0;
+      const remoteNewer = rAt > lAt;
+
+      // 記録: 日付の和集合。両方にある日は更新時刻が新しい方を採用する
+      const logs = {};
+      new Set(Object.keys(L.logs || {}).concat(Object.keys(R.logs || {}))).forEach((d) => {
+        const a = (L.logs || {})[d], b = (R.logs || {})[d];
+        // 画面表示時に作られる「中身のない記録」は無いものとして扱う。
+        // これを勝たせると、相手が入れた実データを空で上書きしてしまう。
+        const aHas = dayHasContent(a), bHas = dayHasContent(b);
+        if (!aHas && !bHas) return;
+        if (!aHas) { logs[d] = b; return; }
+        if (!bHas) { logs[d] = a; return; }
+        logs[d] = ((b._at || rAt) > (a._at || lAt)) ? b : a;
+      });
+      L.logs = logs;
+
+      // 在庫: idで和集合。ただし片方で削除済みのものは復活させない
+      const tomb = {};
+      (L.deletedStock || []).concat(R.deletedStock || []).forEach((t) => {
+        if (t && t.id) tomb[t.id] = Math.max(tomb[t.id] || 0, t.at || 0);
+      });
+      const byId = {};
+      (L.stock || []).concat(R.stock || []).forEach((s) => {
+        if (!s || !s.id) return;
+        if (!byId[s.id]) byId[s.id] = s;
+      });
+      L.stock = Object.values(byId).filter((s) => !tomb[s.id]);
+      L.deletedStock = Object.entries(tomb).map(([id, at]) => ({ id, at }))
+        .sort((a, b) => b.at - a.at).slice(0, 200);
+
+      // 初めて食べた記録: 名前で和集合。初回日は古い方、判定は確定している方を優先
+      const ff = Object.assign({}, R.firstFoods || {});
+      Object.entries(L.firstFoods || {}).forEach(([n, a]) => {
+        const b = ff[n];
+        if (!b) { ff[n] = a; return; }
+        const date = (a.date && b.date) ? (a.date < b.date ? a.date : b.date) : (a.date || b.date);
+        const decided = (x) => x && x.status && x.status !== "trying";
+        const pick = decided(a) && !decided(b) ? a : !decided(a) && decided(b) ? b : (remoteNewer ? b : a);
+        ff[n] = { date, status: pick.status || "trying", symptom: pick.symptom || a.symptom || b.symptom || "" };
+      });
+      L.firstFoods = ff;
+
+      // 写真から登録した食品: 名前で和集合（同名は新しい側を採用）
+      const cf = {};
+      (remoteNewer ? (L.customFoods || []).concat(R.customFoods || [])
+                   : (R.customFoods || []).concat(L.customFoods || []))
+        .forEach((f) => { if (f && f.name && !cf[f.name]) cf[f.name] = f; });
+      L.customFoods = Object.values(cf);
+
+      // 単一の値は新しい側を採用
+      if (remoteNewer) {
+        if (R.profile) L.profile = R.profile;
+        if (R.plan) L.plan = R.plan;
+        if (R.settings && R.settings.snackPerDay != null) L.settings.snackPerDay = R.settings.snackPerDay;
+        if (Array.isArray(R.chat) && R.chat.length) L.chat = R.chat.slice(-40);
+      } else if (!L.profile && R.profile) {
+        L.profile = R.profile;
+      }
+      L.updatedAt = Math.max(lAt, rAt);
+      rebuildFoodIndex();
+      return true;
     },
     log(date) {
       if (!this.data.logs[date]) {
@@ -108,6 +203,95 @@
       return l;
     },
   };
+
+  /* 記録の中身を1本の文字列にして、変更検出に使う（_at 自身は含めない） */
+  function logSig(l) {
+    if (!l) return "";
+    const { _at, ...rest } = l;
+    return JSON.stringify(rest);
+  }
+
+  // ==========================================================================
+  //  同期 — GitHubの秘密Gistを介して端末間でデータを共有する
+  //  サーバを持たずに済むよう、保存先はGistにしている。
+  //  APIキーは同期対象から外し、端末内にのみ置く（persistable() で除外）。
+  // ==========================================================================
+  const Sync = {
+    cfg: {}, busy: false, timer: null, lastError: "",
+    load() { try { this.cfg = JSON.parse(localStorage.getItem(SYNC_KEY)) || {}; } catch (_) { this.cfg = {}; } },
+    saveCfg() { localStorage.setItem(SYNC_KEY, JSON.stringify(this.cfg)); },
+    enabled() { return !!this.cfg.token; },
+    async api(path, opts) {
+      const res = await fetch(`https://api.github.com${path}`, Object.assign({}, opts, {
+        headers: Object.assign({
+          authorization: `Bearer ${this.cfg.token}`,
+          accept: "application/vnd.github+json",
+          "content-type": "application/json",
+        }, (opts || {}).headers),
+      }));
+      if (!res.ok) {
+        const msg = res.status === 401 ? "トークンが無効です（gist権限を確認してください）"
+          : res.status === 404 ? "同期IDが見つかりません"
+          : (await res.text()).slice(0, 120);
+        throw new Error(`同期エラー ${res.status}: ${msg}`);
+      }
+      return res.json();
+    },
+    async push() {
+      const content = JSON.stringify({ app: "baby-healthcare", v: 1, at: Date.now(), data: State.persistable() });
+      const files = { [SYNC_FILE]: { content } };
+      if (this.cfg.gistId) {
+        await this.api(`/gists/${this.cfg.gistId}`, { method: "PATCH", body: JSON.stringify({ files }) });
+      } else {
+        const g = await this.api("/gists", { method: "POST", body: JSON.stringify({
+          description: "ベビー・ヘルスケア 同期データ", public: false, files }) });
+        this.cfg.gistId = g.id;
+      }
+      this.cfg.lastSync = Date.now(); this.saveCfg();
+    },
+    async pull() {
+      if (!this.cfg.gistId) return null;
+      const g = await this.api(`/gists/${this.cfg.gistId}`);
+      const f = g.files && g.files[SYNC_FILE];
+      if (!f) return null;
+      const text = f.truncated ? await (await fetch(f.raw_url)).text() : f.content;
+      const j = JSON.parse(text);
+      return j && j.data ? j.data : null;
+    },
+    /* 取得 → マージ → 送信 */
+    async sync() {
+      if (!this.enabled() || this.busy) return false;
+      this.busy = true; this.lastError = "";
+      try {
+        const remote = await this.pull();
+        if (remote) State.mergeRemote(remote);
+        State.save(true);              // マージ結果を保存（送信は下で行う）
+        await this.push();
+        return true;
+      } catch (e) {
+        this.lastError = e.message; throw e;
+      } finally { this.busy = false; }
+    },
+    /* 保存のたびに呼ばれる。まとめて数秒後に送信する */
+    schedulePush() {
+      if (!this.enabled()) return;
+      clearTimeout(this.timer);
+      this.timer = setTimeout(() => {
+        this.push().then(() => updateSyncBadge()).catch((e) => updateSyncBadge("エラー: " + e.message));
+      }, 4000);
+    },
+  };
+
+  /* 画面上部の同期状態の表示を更新する */
+  function updateSyncBadge(err) {
+    const el = $("#sync-badge");
+    if (!el) return;
+    if (err) { el.textContent = "⚠️ 同期エラー"; el.className = "syncchip bad"; return; }
+    if (!Sync.enabled()) { el.textContent = ""; el.className = "syncchip"; return; }
+    const t = Sync.cfg.lastSync;
+    el.textContent = t ? `☁️ ${new Date(t).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })} 同期` : "☁️ 未同期";
+    el.className = "syncchip";
+  }
 
   function dayHasContent(l) {
     if (!l) return false;
@@ -474,6 +658,7 @@
       { key: "growth", label: "成長", icon: "📈" },
       { key: "menu", label: "献立", icon: "🍳" },
       { key: "foods", label: "食材", icon: "🥕" },
+      { key: "chat", label: "AI相談", icon: "💬" },
       { key: "profile", label: "プロフィール", icon: "👶" },
       { key: "settings", label: "設定", icon: "⚙️" },
     ],
@@ -497,6 +682,7 @@
         <div class="tb-right">
           <div class="today">${new Date().toLocaleDateString("ja-JP", { month: "long", day: "numeric", weekday: "short" })}</div>
           ${p ? `<div class="agechip">${esc(p.name)} ${ageLabel(p.birth)}</div>` : ""}
+          <div id="sync-badge" class="syncchip"></div>
         </div>
       </header>
       <nav class="tabs">
@@ -509,8 +695,10 @@
     if (!p && Nav.current !== "profile") Nav.current = "profile";
     ({
       home: renderHome, record: renderRecord, growth: renderGrowth,
-      menu: renderMenu, foods: renderFoods, profile: renderProfile, settings: renderSettings,
+      menu: renderMenu, foods: renderFoods, chat: renderChat,
+      profile: renderProfile, settings: renderSettings,
     })[Nav.current](view);
+    updateSyncBadge(Sync.lastError ? "err" : null);
   }
 
   // ==========================================================================
@@ -1068,6 +1256,172 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
     }));
   }
 
+  // ==========================================================================
+  //  AI相談 — 記録をふまえてテキストで相談する
+  // ==========================================================================
+  const QUICK_ASKS = [
+    "今日の食事で足りていない栄養は？",
+    "鉄を増やすには何を食べさせたらいい？",
+    "野菜を食べてくれないときの工夫は？",
+    "この月齢で気をつける食材は？",
+    "手づかみ食べにおすすめのメニューは？",
+    "食べムラがひどいときどうする？",
+  ];
+
+  /* お子さんの状況をまとめてAIに渡す文脈を作る */
+  function childContext() {
+    const p = State.data.profile;
+    const months = monthsOld(p.birth);
+    const goals = driFor(months, p.sex);
+    const log = State.log(todayStr());
+    const nut = dayNut(log);
+    const st = stageOf(months);
+    const b = latestBody();
+    const lines = [];
+    lines.push(`お子さん: ${months}ヶ月（${ageLabel(p.birth)}）・${p.sex === "male" ? "男の子" : "女の子"}・${st ? st.name : ""}`);
+    if (b.weight || b.height) {
+      const parts = [];
+      if (b.height) parts.push(`身長${fmt(b.height, 1)}cm（約${fmt(percentileOf(p.sex, "height", monthsOld(p.birth, b.date), b.height))}パーセンタイル）`);
+      if (b.weight) parts.push(`体重${fmt(b.weight, 2)}kg（約${fmt(percentileOf(p.sex, "weight", monthsOld(p.birth, b.date), b.weight))}パーセンタイル）`);
+      const k = kaup(b.weight, b.height);
+      if (k) parts.push(`カウプ指数${fmt(k, 1)}`);
+      lines.push(`直近の計測: ${parts.join(" / ")}`);
+    }
+    if (p.birthWeightG) lines.push(`出生時体重: ${fmt(p.birthWeightG)}g`);
+    lines.push(`1日の目標: エネルギー${goals.kcal}kcal / たんぱく質${goals.protein}g / 鉄${goals.fe}mg / カルシウム${goals.ca}mg / 食塩${goals.salt}g未満`);
+    lines.push(`今日ここまでの摂取: エネルギー${fmt(nut.kcal)}kcal / たんぱく質${fmt(nut.p, 1)}g / 鉄${fmt(nut.fe, 1)}mg / カルシウム${fmt(nut.ca)}mg / 食塩${fmt(nut.salt, 1)}g`);
+    const eaten = MEAL_SLOTS.map((s) => {
+      const items = log.meals[s.key];
+      return items.length ? `${s.label}: ${items.map((i) => `${i.name}${fmt(i.g)}g`).join("、")}` : null;
+    }).filter(Boolean);
+    lines.push(eaten.length ? `今日の食事内容 — ${eaten.join(" / ")}` : "今日の食事はまだ記録がありません");
+    if (log.milk.ml) lines.push(`ミルク・牛乳: ${fmt(log.milk.ml)}ml（${fmt(log.milk.count)}回）`);
+    const ng = Object.entries(State.data.firstFoods).filter(([, v]) => v.status === "ng").map(([n]) => n);
+    if (ng.length) lines.push(`要注意の食材（症状が出たもの）: ${ng.join("、")}`);
+    const stock = stockSorted().slice(0, 12);
+    if (stock.length) lines.push(`冷蔵庫の在庫: ${stock.map((s) => `${s.name}${fmt(s.g)}g(期限まで${daysLeft(s)}日)`).join("、")}`);
+    return lines.join("\n");
+  }
+
+  const CHAT_SYSTEM = `あなたは小児栄養に詳しい管理栄養士です。乳幼児の食事・栄養・生活リズムについて、保護者にわかりやすく助言してください。
+
+守ること:
+- 診断や治療の判断はしない。発育の遅れ、アレルギー症状、体重の急変など医療的な心配がある内容には、必ず小児科医・管理栄養士への相談や乳幼児健診での確認をすすめる
+- 月齢に合った内容にする。特に窒息リスク（丸ごとのぶどう・ミニトマト、ナッツ、豆、餅など）、1歳未満のはちみつ、加熱不足の卵や肉には注意を促す
+- 1〜2歳の食塩の目標は3g未満で大人よりかなり厳しい。減塩を前提に提案する
+- この時期に不足しやすい鉄を意識する。ただしレバーはビタミンAが非常に多く、耐容上限600µgRAE/日を5g程度で超えるため、すすめる場合は3〜4g・週1〜2回までと明記する
+- 体重が重めでも、1〜2歳に対する自己判断のカロリー制限はすすめない。増加のペースを緩めて身長が追いつくのを待つ考え方を伝える
+- 回答は日本語で、300字程度を目安に簡潔に。箇条書きを使ってよい
+- 与えられた記録の数値を根拠として引用し、一般論だけで終わらせない`;
+
+  /* テキスト相談用のAI呼び出し */
+  async function askAI(msgs, system) {
+    const s = State.data.settings;
+    const key = activeKey();
+    if (!key) throw new Error("APIキーが未設定です。設定タブで登録してください。");
+    return (s.provider || "gemini") === "gemini"
+      ? askGemini(key, msgs, system)
+      : askAnthropic(key, msgs, system, s.model || "claude-sonnet-5");
+  }
+  async function askAnthropic(key, msgs, system, model) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json", "x-api-key": key,
+        "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({ model, max_tokens: 1024, system, messages: msgs }),
+    });
+    if (!res.ok) throw new Error(`APIエラー ${res.status}: ${(await res.text()).slice(0, 160)}`);
+    const json = await res.json();
+    return (json.content || []).filter((b) => b.type === "text").map((b) => b.text).join("").trim();
+  }
+  async function askGemini(key, msgs, system) {
+    const models = State.data.settings.geminiModel
+      ? [State.data.settings.geminiModel]
+      : ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"];
+    const body = JSON.stringify({
+      systemInstruction: { parts: [{ text: system }] },
+      contents: msgs.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] })),
+    });
+    let lastErr = null;
+    for (const model of models) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
+      const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body });
+      if (res.status === 404) { lastErr = `モデル ${model} は利用不可`; continue; }
+      if (!res.ok) throw new Error(`Geminiエラー ${res.status}: ${(await res.text()).slice(0, 160)}`);
+      const json = await res.json();
+      const text = ((json.candidates || [])[0]?.content?.parts || []).map((p) => p.text || "").join("").trim();
+      if (!text) throw new Error("応答が空でした（無料枠の上限をご確認ください）");
+      return text;
+    }
+    throw new Error(`利用可能なGeminiモデルが見つかりませんでした（${lastErr || "不明"}）`);
+  }
+
+  function renderChat(view) {
+    const chat = State.data.chat || [];
+    const hasKey = !!activeKey();
+    view.innerHTML = `
+      <section class="card">
+        <div class="row between wrap">
+          <h2>💬 AIに相談</h2>
+          ${chat.length ? `<button class="btn sm" id="ch-clear">履歴を消す</button>` : ""}
+        </div>
+        <p class="muted">お子さんの月齢・成長の記録・今日の食事と栄養の過不足・冷蔵庫の在庫をふまえて回答します。</p>
+        ${hasKey ? "" : `<div class="warn-box">⚠️ 「設定」タブでAPIキーを登録すると使えます（無料のGoogle Geminiも選べます）。</div>`}
+        <div class="row wrap" style="margin:10px 0">
+          ${QUICK_ASKS.map((q, i) => `<button class="btn sm" data-ask="${i}">${esc(q)}</button>`).join("")}
+        </div>
+        <div id="ch-log" class="chat-log">
+          ${chat.length ? chat.map((m) => `<div class="msg ${m.role}">${esc(m.content).replace(/\n/g, "<br>")}</div>`).join("")
+            : `<p class="muted">上のボタンから聞くか、下に自由に質問を入力してください。</p>`}
+        </div>
+        <div class="row" style="margin-top:10px">
+          <input type="text" id="ch-input" placeholder="例: 離乳食を全然食べてくれません" autocomplete="off">
+          <button class="btn primary" id="ch-send">送信</button>
+        </div>
+        <p class="disclaimer">※ AIの回答は一般的な情報です。発育やアレルギーなど医療的な心配は、
+          小児科医・管理栄養士や乳幼児健診でご相談ください。</p>
+      </section>`;
+
+    const logEl = $("#ch-log");
+    logEl.scrollTop = logEl.scrollHeight;
+
+    const send = async (text) => {
+      if (!text) return;
+      if (!activeKey()) { alert("「設定」タブでAPIキーを登録してください。"); return; }
+      State.data.chat = (State.data.chat || []).concat({ role: "user", content: text }).slice(-40);
+      State.save(); renderChat(view);
+      const el = $("#ch-log");
+      el.insertAdjacentHTML("beforeend", `<div class="msg assistant loading" id="ch-wait">🤖 考えています…</div>`);
+      el.scrollTop = el.scrollHeight;
+      try {
+        // 過去のやり取り → 今回の質問 の順に並べる（user/assistant が交互になるように）
+        const history = (State.data.chat || []).slice(0, -1)
+          .filter((m) => !(m.role === "assistant" && m.content.startsWith("⚠️")))
+          .slice(-6);
+        while (history.length && history[0].role !== "user") history.shift();
+        while (history.length && history[history.length - 1].role !== "assistant") history.pop();
+        const answer = await askAI(
+          history.map((m) => ({ role: m.role, content: m.content }))
+            .concat({ role: "user", content: `【いまの記録】\n${childContext()}\n\n【質問】\n${text}` }),
+          CHAT_SYSTEM);
+        State.data.chat = State.data.chat.concat({ role: "assistant", content: answer }).slice(-40);
+      } catch (e) {
+        State.data.chat = State.data.chat.concat({ role: "assistant", content: `⚠️ ${e.message}` }).slice(-40);
+      }
+      State.save(); renderChat(view);
+    };
+
+    $("#ch-send").onclick = () => { const t = $("#ch-input").value.trim(); $("#ch-input").value = ""; send(t); };
+    $("#ch-input").onkeydown = (e) => { if (e.key === "Enter") $("#ch-send").click(); };
+    $$("[data-ask]").forEach((b) => (b.onclick = () => send(QUICK_ASKS[Number(b.dataset.ask)])));
+    if ($("#ch-clear")) $("#ch-clear").onclick = () => {
+      if (!confirm("相談の履歴を消します。よろしいですか？")) return;
+      State.data.chat = []; State.save(); renderChat(view);
+    };
+  }
+
   /* 記録した分だけ在庫を減らす（期限が近いものから） */
   function deductStock(name, g) {
     let left = g;
@@ -1438,6 +1792,8 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
     };
     $$("[data-sdel]").forEach((b) => (b.onclick = () => {
       State.data.stock = State.data.stock.filter((s) => s.id !== b.dataset.sdel);
+      State.data.deletedStock.unshift({ id: b.dataset.sdel, at: Date.now() });
+      State.data.deletedStock = State.data.deletedStock.slice(0, 200);
       State.save(); render();
     }));
     if ($("#go-menu")) $("#go-menu").onclick = () => Nav.go("menu");
@@ -1718,6 +2074,35 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
       </section>` : ""}
 
       <section class="card">
+        <h3>☁️ 端末間でデータを共有</h3>
+        <p class="muted">GitHubの<b>非公開Gist</b>を保存場所にして、2台のiPhoneで同じ記録を見られるようにします。
+          サーバーを用意する必要はありません。</p>
+        <div class="info-box"><b>設定のしかた（2台とも同じトークンを使います）</b><br>
+          1台目: 下でトークンを登録 →「今すぐ同期」→ 表示された<b>同期ID</b>を控える<br>
+          2台目: 同じトークンと、その<b>同期ID</b>を入力 →「今すぐ同期」</div>
+        <label class="block">GitHubトークン
+          <input type="password" id="sy-token" value="${esc(Sync.cfg.token || "")}" placeholder="github_pat_... / ghp_...">
+        </label>
+        <p class="muted"><a href="https://github.com/settings/tokens" target="_blank" rel="noopener">GitHub の設定</a> で作成します。
+          権限は <b>gist だけ</b>で足ります（他は付けないでください）。有効期限も設定しておくと安全です。</p>
+        <label class="block">同期ID（2台目はここに1台目のIDを入れます）
+          <input type="text" id="sy-gist" value="${esc(Sync.cfg.gistId || "")}" placeholder="1台目で同期すると自動で入ります">
+        </label>
+        <div class="row wrap">
+          <button class="btn primary" id="sy-save">保存して今すぐ同期</button>
+          ${Sync.enabled() ? `<button class="btn" id="sy-now">今すぐ同期</button>
+            <button class="btn danger" id="sy-off">同期をやめる</button>` : ""}
+        </div>
+        <div id="sy-status" class="muted">${Sync.cfg.lastSync
+          ? `最終同期: ${new Date(Sync.cfg.lastSync).toLocaleString("ja-JP")}`
+          : "まだ同期していません"}</div>
+        ${Sync.cfg.gistId ? `<p class="muted">同期ID: <code>${esc(Sync.cfg.gistId)}</code></p>` : ""}
+        <div class="warn-box">同期の対象は記録・在庫・食材・献立・相談履歴です。
+          <b>APIキーは同期されません</b>（Gistに置かないため）。2台目では写真解析用のキーを別途登録してください。<br>
+          トークンはあなたのGistを読み書きできます。共有端末では使わず、gist権限のみ・期限付きで作成してください。</div>
+      </section>
+
+      <section class="card">
         <h3>その他</h3>
         <label class="block">1日のおやつの回数
           <select id="snack">
@@ -1771,6 +2156,31 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
       s.keys = { gemini: $("#key-gemini").value.trim(), anthropic: $("#key-anthropic").value.trim() };
       State.save(); render();
     };
+    const runSync = async (statusEl) => {
+      statusEl.textContent = "同期中…"; statusEl.className = "loading";
+      try {
+        await Sync.sync();
+        statusEl.className = "muted";
+        statusEl.textContent = `最終同期: ${new Date(Sync.cfg.lastSync).toLocaleString("ja-JP")}`;
+        render();
+      } catch (e) {
+        statusEl.className = "muted";
+        statusEl.innerHTML = `<span style="color:var(--bad)">${esc(e.message)}</span>`;
+      }
+    };
+    $("#sy-save").onclick = () => {
+      const token = $("#sy-token").value.trim(), gistId = $("#sy-gist").value.trim();
+      if (!token) { alert("GitHubトークンを入力してください。"); return; }
+      Sync.cfg.token = token;
+      Sync.cfg.gistId = gistId || Sync.cfg.gistId || "";
+      Sync.saveCfg();
+      runSync($("#sy-status"));
+    };
+    if ($("#sy-now")) $("#sy-now").onclick = () => runSync($("#sy-status"));
+    if ($("#sy-off")) $("#sy-off").onclick = () => {
+      if (!confirm("この端末での同期を止めます。記録は端末に残ります。よろしいですか？")) return;
+      Sync.cfg = {}; Sync.saveCfg(); render();
+    };
     $$("[data-cfdel]").forEach((b) => (b.onclick = () => {
       State.data.customFoods = State.data.customFoods.filter((f) => f.name !== b.dataset.cfdel);
       State.save(); render();
@@ -1806,8 +2216,14 @@ cautions には次に該当する場合のみ入れてください: 窒息リス
   // ==========================================================================
   //  起動
   // ==========================================================================
+  Sync.load();
   State.load();
   render();
+  // 起動時に一度だけクラウドと同期（取得 → マージ → 送信）
+  if (Sync.enabled()) {
+    Sync.sync().then((okd) => { if (okd) render(); })
+      .catch((e) => updateSyncBadge("エラー: " + e.message));
+  }
   window.addEventListener("resize", () => {
     if (Nav.current === "growth") { drawGrowth(gSel); showGrowthTip(gSel); }
   });
