@@ -40,8 +40,16 @@
   const num = (v, dflt = 0) => { const n = parseFloat(v); return isNaN(n) ? dflt : n; };
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
-  const foodByName = {};
-  FOODS.forEach((f) => (foodByName[f.name] = f));
+  // 食品の索引。内蔵DB(FOODS)とAI解析で登録したカスタム食材の両方を引ける
+  let foodIndex = {};
+  function rebuildFoodIndex() {
+    foodIndex = {};
+    FOODS.forEach((f) => (foodIndex[f.name] = f));
+    ((State.data && State.data.customFoods) || []).forEach((f) => (foodIndex[f.name] = f));
+  }
+  const getFood = (name) => foodIndex[name];
+  // 食材選択・在庫の候補に出す全食品
+  const allFoods = () => FOODS.concat(((State.data && State.data.customFoods) || []));
 
   // ==========================================================================
   //  状態管理
@@ -54,8 +62,9 @@
         logs: {},               // 日付 → 記録
         stock: [],              // 食材在庫
         firstFoods: {},         // 食材名 → { date, status, symptom }
+        customFoods: [],        // 写真AI解析などで登録した独自の食品
         plan: null,             // 直近に生成した献立
-        settings: { snackPerDay: 1 },
+        settings: { snackPerDay: 1, provider: "gemini", model: null, keys: { gemini: "", anthropic: "" } },
       };
     },
     load() {
@@ -65,13 +74,20 @@
       if (!this.data.logs) this.data.logs = {};
       if (!Array.isArray(this.data.stock)) this.data.stock = [];
       if (!this.data.firstFoods) this.data.firstFoods = {};
-      if (!this.data.settings) this.data.settings = { snackPerDay: 1 };
+      if (!Array.isArray(this.data.customFoods)) this.data.customFoods = [];
+      if (!this.data.settings) this.data.settings = {};
+      const s = this.data.settings;
+      if (s.snackPerDay == null) s.snackPerDay = 1;
+      if (!s.provider) s.provider = "gemini";
+      if (!s.keys) s.keys = { gemini: "", anthropic: "" };
+      rebuildFoodIndex();
     },
     save() {
       Object.keys(this.data.logs).forEach((k) => {
         if (!dayHasContent(this.data.logs[k])) delete this.data.logs[k];
       });
       localStorage.setItem(STORE_KEY, JSON.stringify(this.data));
+      rebuildFoodIndex();
     },
     log(date) {
       if (!this.data.logs[date]) {
@@ -135,7 +151,7 @@
   const NUT_KEYS = ["kcal", "p", "f", "c", "fiber", "ca", "fe", "zn", "vc", "vd", "salt"];
 
   function nutOfItem(item) {
-    const f = foodByName[item.name];
+    const f = getFood(item.name);
     const out = {}; NUT_KEYS.forEach((k) => (out[k] = 0));
     if (!f) return out;
     const r = num(item.g) / 100;
@@ -160,7 +176,7 @@
   function vitaminAFromHighFoods(log) {
     let total = 0; const names = [];
     MEAL_SLOTS.forEach((s) => (log.meals[s.key] || []).forEach((it) => {
-      const f = foodByName[it.name];
+      const f = getFood(it.name);
       if (f && f.vaHigh) {
         total += f.vaHigh * (num(it.g) / 100);
         if (!names.includes(it.name)) names.push(it.name);
@@ -263,7 +279,7 @@
   function daysLeft(s) { return daysBetween(todayStr(), stockExpire(s)); }
   // 1歳児の1食目安量から「あと何食分あるか」を出す（少量しか食べないので余りやすい）
   function servingsLeft(s) {
-    const f = foodByName[s.name];
+    const f = getFood(s.name);
     if (!f || !f.serv) return null;
     return s.g / f.serv;
   }
@@ -308,7 +324,7 @@
       if (miss > 0) {
         missG += miss;
         // 主食・調味料は常備しているものとして買い足しペナルティを軽くする
-        const f = foodByName[name];
+        const f = getFood(name);
         const light = f && (f.cat === "調味料" || f.cat === "主食" || f.cat === "飲みもの");
         score -= miss * (light ? 0.15 : 0.6);
       }
@@ -424,7 +440,7 @@
   function leftoverAdvice(leftover) {
     const tips = [];
     leftover.slice(0, 6).forEach((l) => {
-      const f = foodByName[l.name];
+      const f = getFood(l.name);
       const sv = f && f.serv ? l.g / f.serv : null;
       if (l.days <= 1) {
         tips.push(`${l.name}（残${fmt(l.g)}g・期限${l.days <= 0 ? "切れ" : "明日"}）は今日中に加熱して小分け冷凍を。`);
@@ -584,7 +600,7 @@
       if (pct("p", goals.protein) > 200) tips.push({ i: "🍗", t: "たんぱく質がかなり多めです。腎臓に負担がかかるため、肉・魚・卵・乳製品はどれか1品に絞ると整います。" });
       if (pct("vd", goals.vd) < 50) tips.push({ i: "☀️", t: "ビタミンDが少なめです。鮭・しらす・卵と、日中の外遊びで補えます。" });
       const veg = MEAL_SLOTS.reduce((a, s) => a + log.meals[s.key].filter((i) => {
-        const f = foodByName[i.name]; return f && (f.cat === "副菜" || f.cat === "果物");
+        const f = getFood(i.name); return f && (f.cat === "副菜" || f.cat === "果物");
       }).length, 0);
       if (veg === 0) tips.push({ i: "🥕", t: "野菜・果物の記録がありません。にんじんやかぼちゃは甘みがあって食べやすく、冷凍ストックにも向きます。" });
 
@@ -664,10 +680,15 @@
                   <button class="x" data-del="${s.key}:${i}">✕</button></li>`).join("")
                   : `<li style="color:var(--muted)">まだありません</li>`}
               </ul>
-              <button class="btn sm" data-add="${s.key}">＋ 食材を追加</button>
+              <div class="row wrap">
+                <button class="btn sm" data-add="${s.key}">＋ 食材を追加</button>
+                <button class="btn sm ai" data-photo="${s.key}">📷 写真で解析</button>
+              </div>
             </div>`;
           }).join("")}
         </div>
+        <p class="muted">📷 は料理写真からAIが栄養を推定します（「設定」タブでAPIキーを登録すると使えます）。
+          推定値なので、量は必ず目で確認して調整してください。</p>
       </section>
 
       <section class="card">
@@ -711,6 +732,7 @@
     if ($("#r-today")) $("#r-today").onclick = () => { viewDate = todayStr(); render(); };
 
     $$("[data-add]").forEach((b) => (b.onclick = () => openFoodPicker(b.dataset.add)));
+    $$("[data-photo]").forEach((b) => (b.onclick = () => openPhotoPicker(b.dataset.photo)));
     $$("[data-del]").forEach((b) => (b.onclick = () => {
       const [slot, i] = b.dataset.del.split(":");
       log.meals[slot].splice(Number(i), 1);
@@ -756,10 +778,10 @@
     const draw = () => {
       const q = $("#fp-q", bg).value.trim();
       const byAge = $("#fp-age", bg).checked;
-      const list = FOODS.filter((f) => (!q || f.name.includes(q)) && (!byAge || f.from <= months));
+      const list = allFoods().filter((f) => (!q || f.name.includes(q)) && (!byAge || f.from <= months));
       $("#fp-list", bg).innerHTML = list.length ? list.map((f) => `
         <button class="fp-item" data-name="${esc(f.name)}">
-          <span class="fp-name">${esc(f.name)}
+          <span class="fp-name">${esc(f.name)}${f.ai ? ' <span class="badge info sm">写真</span>' : ""}
             <small>${esc(f.cat)} ・ 1食目安 ${f.serv}g ・ ${f.from}ヶ月から${f.algn ? " ・ " + f.algn.map((a) => ALLERGENS[a] ? ALLERGENS[a].label : a).join("/") : ""}</small></span>
           <span class="fp-k">${fmt(f.per100.kcal * f.serv / 100)}kcal</span>
         </button>`).join("")
@@ -767,7 +789,7 @@
       $$(".fp-item", bg).forEach((b) => (b.onclick = () => pickAmount(b.dataset.name)));
     };
     const pickAmount = (name) => {
-      const f = foodByName[name];
+      const f = getFood(name);
       const first = State.data.firstFoods[name];
       $(".modal-body", bg).innerHTML = `
         <h3 style="margin-bottom:4px">${esc(name)}</h3>
@@ -796,6 +818,241 @@
     $("#fp-age", bg).onchange = draw;
     draw();
     $("#fp-q", bg).focus();
+  }
+
+  // ==========================================================================
+  //  写真AI解析 — 料理写真から栄養を推定する
+  // ==========================================================================
+  const AI_CHOICES = {
+    gemini: {
+      label: "Google Gemini（無料）", provider: "gemini", model: null,
+      ph: "AIza...", link: "https://aistudio.google.com/app/apikey", linkName: "Google AI Studio",
+      note: "無料枠内なら課金なしで使えます（1日あたりの回数制限あり）。まずはこれがおすすめ。",
+    },
+    "claude-sonnet-5": {
+      label: "Claude バランス（Sonnet・有料）", provider: "anthropic", model: "claude-sonnet-5",
+      ph: "sk-ant-...", link: "https://console.anthropic.com/settings/keys", linkName: "Anthropic Console",
+      note: "精度と料金のバランスが良い。少量の幼児食の量推定にも比較的強い。",
+    },
+    "claude-opus-5": {
+      label: "Claude 高精度（Opus・有料）", provider: "anthropic", model: "claude-opus-5",
+      ph: "sk-ant-...", link: "https://console.anthropic.com/settings/keys", linkName: "Anthropic Console",
+      note: "推定精度は最も高いが単価も高い。取り分け前後の判別など難しい写真向け。",
+    },
+    "claude-haiku-4-5": {
+      label: "Claude 低コスト（Haiku・有料）", provider: "anthropic", model: "claude-haiku-4-5",
+      ph: "sk-ant-...", link: "https://console.anthropic.com/settings/keys", linkName: "Anthropic Console",
+      note: "安価だが精度は控えめ。枚数が多いときに。",
+    },
+  };
+  function currentAiKey(s) {
+    if ((s.provider || "gemini") === "gemini") return "gemini";
+    return s.model || "claude-sonnet-5";
+  }
+  /* 現在選択中サービスのAPIキーを返す */
+  function activeKey() {
+    const s = State.data.settings;
+    return ((s.keys || {})[s.provider || "gemini"]) || "";
+  }
+
+  /* 写真解析モーダル */
+  function openPhotoPicker(slot) {
+    const slotMeta = MEAL_SLOTS.find((m) => m.key === slot);
+    const months = monthsOld(State.data.profile.birth) || 14;
+    const hasKey = !!activeKey();
+    const bg = document.createElement("div");
+    bg.className = "modal-bg";
+    bg.innerHTML = `
+      <div class="modal">
+        <div class="modal-head"><h3>📷 ${slotMeta.label}を写真で解析</h3><button class="modal-x">✕</button></div>
+        <div class="modal-body">
+          <p class="muted">お子さんの食事の写真から、料理名・重量・カロリー・栄養素をAIが推定します。
+            月齢（${months}ヶ月）を伝えて、幼児食の分量として推定させます。</p>
+          <label class="filedrop"><input type="file" id="ph-file" accept="image/*" hidden>
+            <span>📷 写真を選ぶ / 撮影する</span></label>
+          <div id="ph-preview"></div>
+          <div id="ph-status"></div>
+          <div id="ph-result"></div>
+          ${hasKey ? "" : `<div class="warn-box">⚠️ AI解析には「設定」タブでAPIキーの登録が必要です
+            （無料のGoogle Geminiも選べます）。未登録の場合は「＋ 食材を追加」から手動で入力してください。</div>`}
+        </div>
+      </div>`;
+    document.body.appendChild(bg);
+    const close = () => bg.remove();
+    bg.onclick = (e) => { if (e.target === bg) close(); };
+    $(".modal-x", bg).onclick = close;
+    $("#ph-file", bg).onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        $("#ph-preview", bg).innerHTML = `<img src="${reader.result}" class="ph-img" alt="preview">`;
+        analyzePhoto(reader.result, slot, bg, months);
+      };
+      reader.readAsDataURL(file);
+    };
+  }
+
+  async function analyzePhoto(dataUrl, slot, modal, months) {
+    const statusEl = $("#ph-status", modal), resultEl = $("#ph-result", modal);
+    const s = State.data.settings;
+    const provider = s.provider || "gemini";
+    const key = activeKey();
+    if (!key) {
+      statusEl.innerHTML = `<p class="muted">選択中のサービスのAPIキーが未設定です。「設定」タブで登録してください。</p>`;
+      return;
+    }
+    statusEl.innerHTML = `<p class="loading">🤖 AIが解析中…（数秒かかります）</p>`;
+    resultEl.innerHTML = "";
+    const [meta, b64] = dataUrl.split(",");
+    const media = (meta.match(/data:(.*?);/) || [])[1] || "image/jpeg";
+    const prompt = buildPrompt(months);
+    try {
+      const items = provider === "gemini"
+        ? await callGemini(key, media, b64, prompt)
+        : await callAnthropic(key, media, b64, prompt, s.model || "claude-sonnet-5");
+      showPhotoResult(items, slot, modal, statusEl, resultEl, months);
+    } catch (e) {
+      statusEl.innerHTML = `<div class="warn-box">解析に失敗しました: ${esc(e.message)}<br>
+        「＋ 食材を追加」から手動で入力してください。</div>`;
+    }
+  }
+
+  /* 幼児食向けの解析プロンプト。重量・鉄・カルシウム・塩分・注意点まで返させる */
+  function buildPrompt(months) {
+    const dri = driFor(months, (State.data.profile || {}).sex);
+    return `あなたは小児栄養に詳しい管理栄養士です。この写真は${months}ヶ月の乳幼児が食べる食事です。
+写っている料理ごとに、**この子ども1人分として実際に写っている量**を推定してください。
+乳幼児の1食は大人よりはるかに少量（主食60〜90g、主菜15〜25g、副菜15〜30g程度）です。大人の一人前と混同しないでください。
+
+参考: この月齢の1日の目標は エネルギー${dri.kcal}kcal / たんぱく質${dri.protein}g / 鉄${dri.fe}mg / カルシウム${dri.ca}mg / 食塩${dri.salt}g未満 です。
+
+次のJSON形式のみで回答してください（説明文やコードブロックは不要）:
+{"items":[{"name":"料理名","grams":推定重量g(整数),"kcal":整数,"p":たんぱく質g,"f":脂質g,"c":炭水化物g,"fiber":食物繊維g,"ca":カルシウムmg,"fe":鉄mg,"zn":亜鉛mg,"vc":ビタミンCmg,"vd":ビタミンDµg,"salt":食塩相当量g,"ingredients":["主な食材",...],"allergens":["卵","乳","小麦"など該当する特定原材料のみ],"cautions":["この月齢で注意すべき点があれば簡潔に"]}]}
+
+cautions には次に該当する場合のみ入れてください: 窒息リスクのある形状（丸ごとのぶどう・ミニトマト、ナッツ、豆、こんにゃく等）、加熱が不十分に見える卵や肉、塩分や糖分が多すぎる、この月齢には固すぎる/大きすぎる、はちみつを含む可能性。該当がなければ空配列にしてください。`;
+  }
+
+  function extractItems(text) {
+    const parsed = JSON.parse(String(text).replace(/```json|```/g, "").trim());
+    return parsed.items || [];
+  }
+
+  /* Anthropic Claude で解析（ブラウザから直接呼び出し） */
+  async function callAnthropic(key, media, b64, prompt, model) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({
+        model, max_tokens: 1500,
+        messages: [{ role: "user", content: [
+          { type: "image", source: { type: "base64", media_type: media, data: b64 } },
+          { type: "text", text: prompt },
+        ] }],
+      }),
+    });
+    if (!res.ok) {
+      const body = (await res.text()).slice(0, 200);
+      if (res.status === 404 || /model/i.test(body)) {
+        throw new Error(`モデル ${model} が使えませんでした。設定で別のモデルを選んでください（${res.status}）`);
+      }
+      throw new Error(`APIエラー ${res.status}: ${body}`);
+    }
+    const json = await res.json();
+    const text = (json.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+    return extractItems(text);
+  }
+
+  /* Google Gemini で解析（無料枠あり）。モデル終了に備え候補を順に試す */
+  async function callGemini(key, media, b64, prompt) {
+    const models = State.data.settings.geminiModel
+      ? [State.data.settings.geminiModel]
+      : ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"];
+    const body = JSON.stringify({
+      contents: [{ parts: [
+        { inline_data: { mime_type: media, data: b64 } },
+        { text: prompt },
+      ] }],
+      generationConfig: { responseMimeType: "application/json" },
+    });
+    let lastErr = null;
+    for (const model of models) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
+      const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body });
+      if (res.status === 404) { lastErr = `モデル ${model} は利用不可`; continue; }
+      if (!res.ok) throw new Error(`Geminiエラー ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      const json = await res.json();
+      const text = ((json.candidates || [])[0]?.content?.parts || []).map((p) => p.text || "").join("");
+      if (!text) throw new Error("応答が空でした（無料枠の上限や画像内容をご確認ください）");
+      return extractItems(text);
+    }
+    throw new Error(`利用可能なGeminiモデルが見つかりませんでした（${lastErr || "不明"}）`);
+  }
+
+  /* AIの推定値を「100gあたり」に正規化してカスタム食品として扱えるようにする */
+  function aiItemToFood(it, months) {
+    const g = Math.max(1, num(it.grams, 0) || 50);
+    const per100 = {};
+    NUT_KEYS.forEach((k) => (per100[k] = (num(it[k]) / g) * 100));
+    const algn = [];
+    (it.allergens || []).forEach((label) => {
+      const hit = Object.entries(ALLERGENS).find(([, v]) => v.label === String(label).trim());
+      if (hit && !algn.includes(hit[0])) algn.push(hit[0]);
+    });
+    return {
+      name: String(it.name || "料理").slice(0, 40), cat: "AI推定", per100,
+      serv: Math.round(g), unit: Math.round(g), from: Math.min(months, 5),
+      frz: false, share: false, ai: true,
+      algn: algn.length ? algn : undefined,
+      note: (it.cautions || []).length ? (it.cautions || []).join(" / ") : undefined,
+    };
+  }
+
+  function showPhotoResult(items, slot, modal, statusEl, resultEl, months) {
+    if (!items.length) { statusEl.innerHTML = `<p class="muted">料理を検出できませんでした。</p>`; return; }
+    const goals = driFor(months, (State.data.profile || {}).sex);
+    statusEl.innerHTML = `<div class="good-box">✅ ${items.length}品を検出しました。<b>推定値なので量を確認・調整してから</b>追加してください。</div>`;
+    resultEl.innerHTML = items.map((it, i) => {
+      const g = Math.max(1, num(it.grams, 0) || 50);
+      const saltPct = goals.salt ? (num(it.salt) / goals.salt) * 100 : 0;
+      const cautions = (it.cautions || []).filter(Boolean);
+      return `<div class="ph-card">
+        <div class="row between wrap"><strong>${esc(it.name || "料理")}</strong>
+          <span>${fmt(num(it.kcal))}kcal</span></div>
+        <div class="ph-macros">推定 ${fmt(g)}g ・ たんぱく質 ${fmt(num(it.p), 1)}g / 脂質 ${fmt(num(it.f), 1)}g / 炭水化物 ${fmt(num(it.c), 1)}g</div>
+        <div class="ph-macros">鉄 ${fmt(num(it.fe), 1)}mg ・ カルシウム ${fmt(num(it.ca))}mg ・ 食塩 ${fmt(num(it.salt), 1)}g
+          ${saltPct >= 33 ? `<span class="badge sm ${saltPct >= 50 ? "bad" : "warn"}">1日の目標の${fmt(saltPct)}%</span>` : ""}</div>
+        ${it.ingredients && it.ingredients.length ? `<div class="muted">食材: ${esc(it.ingredients.join("、"))}</div>` : ""}
+        ${it.allergens && it.allergens.length ? `<div class="muted">アレルギー: ${esc(it.allergens.join("、"))}</div>` : ""}
+        ${cautions.length ? `<div class="warn-box">⚠️ ${cautions.map(esc).join("<br>⚠️ ")}</div>` : ""}
+        <label class="block">記録する量(g)<input type="number" class="ph-g" data-i="${i}" value="${Math.round(g)}" min="1" step="1"></label>
+        <button class="btn sm primary" data-add="${i}">＋ ${MEAL_SLOTS.find((m) => m.key === slot).label}に追加</button>
+      </div>`;
+    }).join("");
+
+    $$("[data-add]", resultEl).forEach((b) => (b.onclick = () => {
+      const i = parseInt(b.dataset.add, 10);
+      const it = items[i];
+      const g = num($(`.ph-g[data-i="${i}"]`, resultEl).value, 0);
+      if (g <= 0) return;
+      const food = aiItemToFood(it, months);
+      // 同名のカスタム食品は上書きし、次回から「＋ 食材を追加」の候補にも出す
+      State.data.customFoods = State.data.customFoods.filter((f) => f.name !== food.name);
+      State.data.customFoods.push(food);
+      rebuildFoodIndex();
+      State.log(viewDate).meals[slot].push({ name: food.name, g });
+      if (!State.data.firstFoods[food.name]) {
+        State.data.firstFoods[food.name] = { date: viewDate, status: "trying", symptom: "" };
+      }
+      State.save();
+      b.textContent = "追加済み ✓"; b.disabled = true;
+      render();
+    }));
   }
 
   /* 記録した分だけ在庫を減らす（期限が近いものから） */
@@ -1090,7 +1347,7 @@
         <div class="scroll-x"><table class="tbl">
           <thead><tr><th>食材</th><th class="num">必要量</th><th>ひとことメモ</th></tr></thead>
           <tbody>${res.shopping.map((s) => {
-            const f = foodByName[s.name];
+            const f = getFood(s.name);
             const packs = f && f.unit ? s.g / f.unit : null;
             return `<tr><td>${esc(s.name)}</td><td class="num">${fmt(s.g)}g</td>
               <td class="muted">${packs && packs < 0.5
@@ -1159,7 +1416,7 @@
           <thead><tr><th>食材</th><th>初回</th><th>状態</th><th>症状メモ</th></tr></thead>
           <tbody>
             ${names.map((n) => {
-              const r = ff[n], f = foodByName[n];
+              const r = ff[n], f = getFood(n);
               return `<tr>
                 <td>${esc(n)}${f && f.algn ? ` <span class="badge sm info">${f.algn.map((a) => ALLERGENS[a] ? ALLERGENS[a].label : a).join("/")}</span>` : ""}</td>
                 <td>${esc(r.date || "")}</td>
@@ -1255,9 +1512,56 @@
   function renderSettings(view) {
     const s = State.data.settings;
     const days = Object.keys(State.data.logs).length;
+    const aiKey = currentAiKey(s);
+    const info = AI_CHOICES[aiKey] || AI_CHOICES.gemini;
+    const keys = s.keys || { gemini: "", anthropic: "" };
+    const has = (p) => (keys[p] ? "✅登録済み" : "未登録");
+
     view.innerHTML = `
       <section class="card">
         <h2>設定</h2>
+        <h3>📷 写真AI解析（任意）</h3>
+        <p class="muted">料理写真から料理名・重量・カロリー・栄養素を推定します。
+          APIキーはこの端末のブラウザ内（localStorage）にのみ保存され、外部へ送られるのは
+          解析時に選んだAIサービスへの通信（写真と月齢）だけです。</p>
+        <div class="warn-box">ブラウザから直接APIを呼ぶ方式のため、キーは同じ端末を使える人には見えます。
+          共有端末では使わないでください。未登録でも、手入力での記録・分析・献立はすべて使えます。</div>
+
+        <label class="block">使うAIサービス（切り替えると対応キーを自動で使います）
+          <select id="set-ai">
+            ${Object.entries(AI_CHOICES).map(([k, v]) => `<option value="${k}" ${aiKey === k ? "selected" : ""}>${esc(v.label)}</option>`).join("")}
+          </select>
+        </label>
+        <p class="muted">現在: <b>${esc(info.label)}</b> — ${esc(info.note)}</p>
+
+        <label class="block">Google Gemini のキー <span class="badge sm ${keys.gemini ? "good" : "warn"}">${has("gemini")}</span>
+          <input type="password" id="key-gemini" value="${esc(keys.gemini || "")}" placeholder="AIza...">
+        </label>
+        <p class="muted"><a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener">Google AI Studio</a> で無料取得できます</p>
+        <label class="block">Anthropic Claude のキー <span class="badge sm ${keys.anthropic ? "good" : "warn"}">${has("anthropic")}</span>
+          <input type="password" id="key-anthropic" value="${esc(keys.anthropic || "")}" placeholder="sk-ant-...">
+        </label>
+        <p class="muted"><a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">Anthropic Console</a> で取得（従量課金）</p>
+        <button class="btn primary" id="ai-save">AI設定を保存</button>
+      </section>
+
+      ${State.data.customFoods.length ? `<section class="card">
+        <h3>写真から登録された料理（${State.data.customFoods.length}件）</h3>
+        <p class="muted">解析した料理は次回から「＋ 食材を追加」の候補に出ます。推定値なので、
+          実際と合わない場合は削除して手入力し直してください。</p>
+        <div class="scroll-x"><table class="tbl">
+          <thead><tr><th>料理</th><th class="num">1食目安</th><th class="num">100gあたり</th><th></th></tr></thead>
+          <tbody>
+            ${State.data.customFoods.map((f) => `<tr>
+              <td>${esc(f.name)}</td>
+              <td class="num">${fmt(f.serv)}g</td>
+              <td class="num">${fmt(f.per100.kcal)}kcal</td>
+              <td><button class="btn xs danger" data-cfdel="${esc(f.name)}">削除</button></td></tr>`).join("")}
+          </tbody></table></div>
+      </section>` : ""}
+
+      <section class="card">
+        <h3>その他</h3>
         <label class="block">1日のおやつの回数
           <select id="snack">
             ${[0, 1, 2].map((n) => `<option value="${n}" ${num(s.snackPerDay, 1) === n ? "selected" : ""}>${n}回</option>`).join("")}
@@ -1304,6 +1608,16 @@
       s.snackPerDay = num($("#snack").value, 1);
       State.save(); render();
     };
+    $("#ai-save").onclick = () => {
+      const c = AI_CHOICES[$("#set-ai").value] || AI_CHOICES.gemini;
+      s.provider = c.provider; s.model = c.model;
+      s.keys = { gemini: $("#key-gemini").value.trim(), anthropic: $("#key-anthropic").value.trim() };
+      State.save(); render();
+    };
+    $$("[data-cfdel]").forEach((b) => (b.onclick = () => {
+      State.data.customFoods = State.data.customFoods.filter((f) => f.name !== b.dataset.cfdel);
+      State.save(); render();
+    }));
     $("#exp").onclick = () => {
       const blob = new Blob([JSON.stringify(State.data, null, 2)], { type: "application/json" });
       const a = document.createElement("a");
