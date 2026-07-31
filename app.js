@@ -543,6 +543,7 @@
     MEAL_SLOTS.forEach((s) => {
       $(`#add-${s.key}`).onclick = () => openFoodPicker(s);
       $(`#photo-${s.key}`).onclick = () => openPhotoPicker(s);
+      $(`#text-${s.key}`).onclick = () => openTextPicker(s);
       const again = $(`#again-${s.key}`);
       if (again) again.onclick = () => {
         const prev = lastSameSlot(s.key);
@@ -599,6 +600,7 @@
         <div class="row wrap">
           <button class="btn sm" id="add-${s.key}">＋ 料理を選ぶ</button>
           <button class="btn sm ai" id="photo-${s.key}">📷 写真で解析</button>
+          <button class="btn sm ai" id="text-${s.key}">✍️ 文章で入力</button>
           ${lastSameSlot(s.key) ? `<button class="btn sm" id="again-${s.key}">🔁 前回と同じ</button>` : ""}
         </div>
       </div>`;
@@ -709,6 +711,144 @@
         analyzePhoto(reader.result, slot, modal);
       };
       reader.readAsDataURL(file);
+    };
+  }
+
+  // ---- 文章での食事入力 ---------------------------------------------------
+  // 「イカリング、ポテトサラダ、白米少量…」のような自然文から料理を切り出し、
+  // 1品ずつのカロリー・栄養素を推定する。写真を撮り忘れた日の後追い入力に使う。
+  function openTextPicker(slot) {
+    const modal = makeModal(`✍️ ${slot.label}を文章で入力`);
+    const body = $(".modal-body", modal);
+    const hasKey = !!activeKey();
+    body.innerHTML = `
+      <p class="muted">食べたものを普通の文章で書くだけで、料理ごとに分けてカロリーと栄養素を推定します。
+        「少量」「大盛り」「2個」などの量の表現も反映されます。</p>
+      <textarea id="tx-input" rows="4" placeholder="例: イカリング、ポテトサラダ、コロッケ、だし巻き、納豆、白米少量、大根人参サラダを食べた"></textarea>
+      <div class="row wrap" style="margin-top:8px">
+        <button class="btn primary" id="tx-go">この内容で解析</button>
+      </div>
+      <div id="tx-status"></div>
+      <div id="tx-result"></div>
+      ${hasKey ? "" : `<p class="warn-box">⚠️ 解析には設定画面でAPIキーの登録が必要です（無料のGoogle Geminiも選べます）。
+        未登録の場合は「料理を選ぶ」から手動で追加してください。</p>`}`;
+    const run = () => {
+      const text = $("#tx-input", body).value.trim();
+      if (!text) { alert("食べたものを入力してください。"); return; }
+      analyzeText(text, slot, modal);
+    };
+    $("#tx-go", body).onclick = run;
+    // 文章入力なので Enter は改行のまま。⌘/Ctrl+Enter で送信できるようにする
+    $("#tx-input", body).onkeydown = (e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) run(); };
+    $("#tx-input", body).focus();
+  }
+
+  async function analyzeText(text, slot, modal) {
+    const statusEl = $("#tx-status", modal), resultEl = $("#tx-result", modal);
+    const provider = State.data.settings.provider || "gemini";
+    const key = activeKey();
+    if (!key) { statusEl.innerHTML = `<p class="muted">選択中のサービスのAPIキーが未設定です。設定画面で登録してください。</p>`; return; }
+    statusEl.innerHTML = `<p class="loading">🤖 解析中…（数秒かかります）</p>`;
+    resultEl.innerHTML = "";
+    const prompt = `次の文章は、ある人が「${slot.label}」に食べたものの記録です。管理栄養士として、料理ごとに分けて1人前の栄養を推定してください。
+
+文章: 「${text}」
+
+守ること:
+- 料理は1品ずつ分ける。「〜を食べた」「昨日は」などの前後の言葉は無視して料理名だけを取り出す
+- 「少量」「小盛り」は通常の約6割、「大盛り」「たっぷり」は約1.5倍、「2個」「3切れ」などの個数はその分を掛けて量を見積もる
+- unit には推定した分量がわかる表現を入れる（例: "1人前 約150g"、"小盛り 約100g"）
+- 日本の一般的な家庭料理・惣菜の値を使う。揚げ物は衣と吸油を含めて見積もる
+- 料理として解釈できない語は無視する
+
+次のJSON形式のみで回答してください（説明文やコードブロックは不要）:
+{"items":[{"name":"料理名","unit":"分量の表現","kcal":整数,"p":たんぱく質g,"f":脂質g,"c":炭水化物g,"fiber":食物繊維g,"salt":食塩相当量g}]}`;
+    const model = State.data.settings.model || "claude-opus-4-8";
+    try {
+      const items = provider === "gemini"
+        ? await askGeminiJson(key, prompt)
+        : await askAnthropicJson(key, prompt, model);
+      showTextResult(items, slot, modal, statusEl, resultEl);
+    } catch (e) {
+      statusEl.innerHTML = `<p class="warn-box">解析に失敗しました: ${e.message}<br>「料理を選ぶ」から手動で追加してください。</p>`;
+    }
+  }
+  // 画像なしでJSONだけを取るための呼び出し
+  async function askAnthropicJson(key, prompt, model) {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json", "x-api-key": key,
+        "anthropic-version": "2023-06-01", "anthropic-dangerous-direct-browser-access": "true",
+      },
+      body: JSON.stringify({ model: model || "claude-opus-4-8", max_tokens: 1500,
+        messages: [{ role: "user", content: prompt }] }),
+    });
+    if (!res.ok) throw new Error(`APIエラー ${res.status}: ${(await res.text()).slice(0, 200)}`);
+    const json = await res.json();
+    return extractItems((json.content || []).filter((b) => b.type === "text").map((b) => b.text).join(""));
+  }
+  async function askGeminiJson(key, prompt) {
+    const models = State.data.settings.geminiModel
+      ? [State.data.settings.geminiModel]
+      : ["gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash"];
+    const body = JSON.stringify({
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { responseMimeType: "application/json" },
+    });
+    let lastErr = null;
+    for (const model of models) {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(key)}`;
+      const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body });
+      if (res.status === 404) { lastErr = `モデル ${model} は利用不可`; continue; }
+      if (!res.ok) throw new Error(`Geminiエラー ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      const json = await res.json();
+      const t = ((json.candidates || [])[0]?.content?.parts || []).map((p) => p.text || "").join("");
+      if (!t) throw new Error("応答が空でした（無料枠の上限をご確認ください）");
+      return extractItems(t);
+    }
+    throw new Error(`利用可能なGeminiモデルが見つかりませんでした（${lastErr || "不明"}）`);
+  }
+
+  /* 解析結果を一覧で見せ、いらない品を外してからまとめて追加する */
+  function showTextResult(items, slot, modal, statusEl, resultEl) {
+    if (!items.length) { statusEl.innerHTML = `<p class="muted">料理を読み取れませんでした。書き方を変えてお試しください。</p>`; return; }
+    const total = items.reduce((a, it) => a + (it.kcal || 0), 0);
+    statusEl.innerHTML = `<p class="good-box">✅ ${items.length}品・合計 ${fmt(total)}kcal と推定しました。
+      内容を確認し、違う品はチェックを外して追加してください。</p>`;
+    resultEl.innerHTML = items.map((it, i) => `
+      <div class="ph-card">
+        <label class="tx-row">
+          <input type="checkbox" class="tx-ck" data-i="${i}" checked>
+          <span class="tx-name"><strong>${escapeHtml(it.name || "料理")}</strong>
+            <small>${escapeHtml(it.unit || "1人前")}</small></span>
+          <span class="tx-kcal">${fmt(it.kcal || 0)}kcal</span>
+        </label>
+        <div class="ph-macros">P ${fmt(it.p || 0, 1)}g / F ${fmt(it.f || 0, 1)}g / C ${fmt(it.c || 0, 1)}g
+          ・ 食物繊維 ${fmt(it.fiber || 0, 1)}g ・ 塩分 ${fmt(it.salt || 0, 1)}g</div>
+      </div>`).join("")
+      + `<button class="btn primary block" id="tx-add">選んだ品を${slot.label}に追加</button>`;
+
+    const sum = () => {
+      const picked = $$(".tx-ck", resultEl).filter((c) => c.checked).map((c) => items[Number(c.dataset.i)]);
+      const k = picked.reduce((a, it) => a + (it.kcal || 0), 0);
+      $("#tx-add", resultEl).textContent = `選んだ${picked.length}品（${fmt(k)}kcal）を${slot.label}に追加`;
+      return picked;
+    };
+    $$(".tx-ck", resultEl).forEach((c) => (c.onchange = sum));
+    sum();
+    $("#tx-add", resultEl).onclick = () => {
+      const picked = sum();
+      if (!picked.length) { alert("追加する品を選んでください。"); return; }
+      picked.forEach((it) => {
+        State.log(recordDate).meals[slot.key].push({
+          name: it.name || "料理", unit: it.unit || "AI推定 1人前",
+          kcal: it.kcal || 0, p: it.p || 0, f: it.f || 0, c: it.c || 0,
+          fiber: it.fiber || 0, salt: it.salt || 0, qty: 1, at: Date.now(),
+        });
+        addCustomFood(it);   // 次回から「料理を選ぶ」候補にも表示
+      });
+      State.save(); modal.remove(); render();
     };
   }
 
