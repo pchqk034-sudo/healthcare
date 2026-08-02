@@ -20,6 +20,14 @@
   // 日付は必ず端末のローカル時刻で扱う（UTC基準にすると日本では深夜〜朝9時が前日扱いになる）
   const dstr = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   const todayStr = () => dstr(new Date());
+  // 日付を n 日ずらす。今日より先には進めない（記録は過去分しか入らないため）
+  const shiftDate = (s, n) => {
+    const [y, m, d] = String(s).split("-").map(Number);
+    const dt = new Date(y, m - 1, d);
+    dt.setDate(dt.getDate() + n);
+    const next = dstr(dt);
+    return next > todayStr() ? todayStr() : next;
+  };
 
   // ---- 状態管理 -----------------------------------------------------------
   const State = {
@@ -496,7 +504,9 @@
         <div class="row between wrap">
           <h2>記録する</h2>
           <div class="row wrap" style="gap:8px">
+            <button class="btn sm" id="rec-prev" title="前日">‹ 前日</button>
             <input type="date" id="rec-date" value="${recordDate}" max="${todayStr()}">
+            <button class="btn sm" id="rec-next" title="翌日" ${recordDate >= todayStr() ? "disabled" : ""}>翌日 ›</button>
             ${recordDate === todayStr() ? "" : `<button class="btn sm" id="rec-today">今日に戻る</button>`}
           </div>
         </div>
@@ -532,6 +542,8 @@
       </section>`;
 
     $("#rec-date").onchange = (e) => { recordDate = e.target.value; render(); };
+    $("#rec-prev").onclick = () => { recordDate = shiftDate(recordDate, -1); render(); };
+    $("#rec-next").onclick = () => { recordDate = shiftDate(recordDate, 1); render(); };
     const recDel = $("#rec-del");
     if (recDel) recDel.onclick = () => {
       if (confirm(`${recordDate} の記録を削除します。よろしいですか？`)) {
@@ -1198,7 +1210,9 @@
           <span class="badge ${cat.tone}">BMI ${fmt(bmi, 1)}・${cat.label}</span>
         </div>
         <div class="row wrap" style="gap:8px;margin:6px 0 12px">
+          <button class="btn sm" id="dash-prev" title="前日">‹ 前日</button>
           <input type="date" id="dash-date" value="${date}" max="${todayStr()}">
+          <button class="btn sm" id="dash-next" title="翌日" ${isToday ? "disabled" : ""}>翌日 ›</button>
           ${isToday ? "" : `<button class="btn sm" id="dash-today">今日に戻る</button>`}
           <button class="btn sm ai" id="dash-recipe">🍽 残りで何食べる？</button>
         </div>
@@ -1247,6 +1261,8 @@
         ${renderPFC(totals.all)}
       </section>`;
     $("#dash-date").onchange = (e) => { dashDate = e.target.value; renderDashboard(view); };
+    $("#dash-prev").onclick = () => { dashDate = shiftDate(dashDate, -1); renderDashboard(view); };
+    $("#dash-next").onclick = () => { dashDate = shiftDate(dashDate, 1); renderDashboard(view); };
     const backBtn = $("#dash-today");
     if (backBtn) backBtn.onclick = () => { dashDate = todayStr(); renderDashboard(view); };
     $("#dash-recipe").onclick = () => openRecipeSuggest(dashDate);
