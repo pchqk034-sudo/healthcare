@@ -406,7 +406,10 @@
     app.innerHTML = `
       <header class="topbar">
         <div class="brand">🍱 <span>ミール・ヘルスケア</span></div>
-        <div class="today">${new Date().toLocaleDateString("ja-JP", { month: "long", day: "numeric", weekday: "short" })}</div>
+        <div class="tb-right">
+          <div class="today">${new Date().toLocaleDateString("ja-JP", { month: "long", day: "numeric", weekday: "short" })}</div>
+          <a class="applink" href="baby/index.html">👶 子ども用へ</a>
+        </div>
       </header>
       <nav class="tabs">
         ${Nav.tabs.map((t) => `<button class="tab ${Nav.current === t.key ? "active" : ""}" data-tab="${t.key}">

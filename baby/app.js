@@ -682,6 +682,7 @@
         <div class="tb-right">
           <div class="today">${new Date().toLocaleDateString("ja-JP", { month: "long", day: "numeric", weekday: "short" })}</div>
           ${p ? `<div class="agechip">${esc(p.name)} ${ageLabel(p.birth)}</div>` : ""}
+          <a class="applink" href="../index.html">🍱 大人用へ</a>
           <div id="sync-badge" class="syncchip"></div>
         </div>
       </header>

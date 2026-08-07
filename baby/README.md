@@ -8,6 +8,10 @@
 
 **公開URL: https://pchqk034-sudo.github.io/healthcare/baby/**
 
+画面右上の **「🍱 大人用へ」** から、大人向けの
+[ミール・ヘルスケア](https://pchqk034-sudo.github.io/healthcare/) に切り替えられる
+（向こう側にも「👶 子ども用へ」がある）。データの保存先は別なので混ざらない。
+
 ## できること
 
 ### 📊 ホーム — 栄養の過不足
